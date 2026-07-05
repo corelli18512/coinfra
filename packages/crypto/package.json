@@ -1,7 +1,7 @@
 {
   "name": "@coinfra/crypto",
-  "version": "0.2.1",
-  "description": "Hybrid E2E encryption primitives — RSA-OAEP key wrapping + AES-256-GCM, multi-recipient, blob encoding, and challenge-response signing. Node.js, no dependencies.",
+  "version": "0.1.0",
+  "description": "Modern hybrid public-key encryption (X25519 + HKDF-SHA256 + AES-256-GCM) and Ed25519 challenge-response signing. Multi-recipient, self-describing envelopes. Cross-platform Web Crypto, no dependencies.",
   "type": "module",
   "exports": {
     ".": {

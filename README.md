@@ -10,7 +10,7 @@ once, reuse it everywhere.
 
 | Package | What |
 |---|---|
-| [`@coinfra/crypto`](packages/crypto) | Hybrid RSA-OAEP + AES-256-GCM encryption, multi-recipient blobs, and challenge-response signing. |
+| [`@coinfra/crypto`](packages/crypto) | Hybrid public-key encryption (X25519 + AES-256-GCM) and Ed25519 signing, for many recipients. Cross-platform Web Crypto. |
 | [`@coinfra/pulse`](packages/pulse) | Reliable message delivery over a breakable WebSocket. |
 
 ## Toolchain

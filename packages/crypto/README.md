@@ -1,11 +1,12 @@
 # @coinfra/crypto
 
-**Hybrid end-to-end encryption primitives: RSA-OAEP key wrapping + AES-256-GCM.
-Multi-recipient, blob encoding, and challenge-response signing. No dependencies.**
+**Modern hybrid public-key encryption + challenge-response signing. Encrypt one message
+to many recipients. Built on the Web Crypto API — runs on browsers, Node, Deno, Bun and
+edge runtimes. Zero dependencies.**
 
-`@coinfra/crypto` provides the Node.js crypto primitives for multi-recipient message
-encryption, compact key export, blob encoding, and challenge-response signing. It knows
-nothing about any application — it moves opaque strings.
+`@coinfra/crypto` moves opaque strings: it knows nothing about any application. Give it a
+plaintext and a set of recipient public keys, and it returns a compact, self-describing
+envelope that only those recipients can open.
 
 ## Install
 
@@ -13,78 +14,103 @@ nothing about any application — it moves opaque strings.
 pnpm add @coinfra/crypto
 ```
 
-## What it includes
+Requires a runtime with the Web Crypto API and X25519/Ed25519 support (Node 20+, Deno,
+Bun, and current browsers).
 
-- RSA-OAEP 4096-bit key generation
-- AES-256-GCM payload encryption
-- per-recipient wrapped keys for multi-device delivery
-- blob encoding: `base64(iv ‖ ciphertext ‖ tag)`
-- blob-level encrypt/decrypt helpers
-- compact public-key export/import helpers
-- challenge signing and verification helpers
-- stable `canonicalJson` for signable payloads
+## Cipher suite (v1)
+
+| Layer | Algorithm |
+|---|---|
+| Key encapsulation | ephemeral **X25519** ECDH + **HKDF-SHA256** (HPKE-style) |
+| Payload & key wrap | **AES-256-GCM** |
+| Signatures | **Ed25519** |
+
+Every envelope carries a version + suite identifier, so the scheme can evolve without
+breaking existing ciphertext.
 
 ## How it works
 
-One random AES-256 key per message encrypts the payload with AES-256-GCM. That AES key is
-then wrapped once per recipient with the recipient's RSA public key (RSA-OAEP, SHA-256).
-Each recipient unwraps their copy of the AES key with their private key, then decrypts the
-single shared ciphertext. GCM's auth tag makes any tampering (ciphertext, IV, tag, or a
-wrapped key) fail loudly on decrypt.
+A fresh 256-bit content key encrypts the payload with AES-256-GCM. That content key is
+then wrapped **independently for each recipient**: a per-recipient ephemeral X25519 key
+does ECDH against the recipient's public key, HKDF-SHA256 derives a wrapping key, and
+AES-256-GCM seals the content key. Each recipient reverses only their own wrap, then
+decrypts the single shared ciphertext. GCM's auth tag makes any tampering — payload,
+nonce, or a wrapped key — fail loudly.
 
-## Blob API
+All operations are asynchronous (the Web Crypto API is promise-based).
 
-### `encryptToBlob(plaintext, recipients)` → `{ blob, keys }`
+## API
 
-Encrypts a plaintext string for one or more recipients. Returns a single base64 blob
-(`iv ‖ ciphertext ‖ tag`) and a map of wrapped AES keys, one per recipient device.
-
-### `decryptFromBlob({ blob, keys }, deviceId, privateKey)` → `plaintext`
-
-Decrypts a blob using the calling device's private key. Looks up the wrapped key by
-`deviceId`, unwraps it with RSA-OAEP, and decrypts the blob.
-
-### `payloadToBlob(payload)` → `blobPayload`
-
-Converts a separated payload (iv, ciphertext, tag, keys) into the consolidated blob format.
-
-### `blobToPayload(blobPayload)` → `payload`
-
-Converts a blob payload back into separated fields. Useful for interop or debugging.
-
-## Blob format
-
-The blob is a single base64 string encoding the concatenation of:
-
-1. **IV** — 12 bytes (AES-256-GCM initialization vector)
-2. **Ciphertext** — variable length
-3. **Tag** — 16 bytes (GCM authentication tag)
-
-This keeps the wire format compact — one string instead of three separate fields.
-
-## Example
+### Keys
 
 ```ts
-import { generateKeyPair, encryptToBlob, decryptFromBlob } from '@coinfra/crypto';
+import { generateEncryptionKeyPair, generateSigningKeyPair } from '@coinfra/crypto';
 
-const alice = generateKeyPair();
-
-const { blob, keys } = encryptToBlob('hello', [
-  { deviceId: 'alice', publicKey: alice.publicKey },
-]);
-
-const plaintext = decryptFromBlob({ blob, keys }, 'alice', alice.privateKey);
+const enc = await generateEncryptionKeyPair(); // X25519,  for encrypt / decrypt
+const sig = await generateSigningKeyPair();    // Ed25519, for sign / verify
+// each -> { publicKey, privateKey }  (compact base64url strings, wire-ready)
 ```
 
-## Challenge-response
+Encryption and signing use separate key pairs by design.
+
+### Encrypt to many recipients
+
+```ts
+import { encrypt, decrypt } from '@coinfra/crypto';
+
+const envelope = await encrypt('hello', [
+  { recipientId: 'alice', publicKey: alice.publicKey },
+  { recipientId: 'bob', publicKey: bob.publicKey },
+]);
+
+await decrypt(envelope, 'alice', alice.privateKey); // 'hello'
+await decrypt(envelope, 'bob', bob.privateKey);     // 'hello'
+```
+
+`recipientId` is an opaque label you choose (a user id, device id, key id — anything).
+
+### Compact self-contained blob
+
+```ts
+import { encryptToBlob, decryptFromBlob } from '@coinfra/crypto';
+
+const blob = await encryptToBlob('hello', [
+  { recipientId: 'alice', publicKey: alice.publicKey },
+]);
+// blob is a single base64url string containing everything needed to decrypt
+
+await decryptFromBlob(blob, 'alice', alice.privateKey); // 'hello'
+```
+
+`serializeEnvelope(envelope)` / `deserializeEnvelope(blob)` convert between the structured
+`Envelope` object (JSON-friendly) and the compact binary blob directly.
+
+### Challenge-response signing
 
 ```ts
 import { signChallenge, verifyChallenge, canonicalJson } from '@coinfra/crypto';
 
-const canonical = canonicalJson({ sub: 'user', exp: 2000 }); // stable, sorted keys
-const sig = signChallenge(canonical, alice.privateKey);
-verifyChallenge(canonical, sig, alice.publicKey); // true
+const canonical = canonicalJson({ sub: 'user', exp: 2000 }); // stable, recursively sorted
+const signature = await signChallenge(canonical, sig.privateKey);
+await verifyChallenge(canonical, signature, sig.publicKey);  // true
 ```
 
-This package targets Node.js via the built-in `node:crypto` module. A Web Crypto port would
-share the same interface.
+`verifyChallenge` never throws — it returns `false` on any malformed input.
+
+`canonicalJson` produces RFC 8785-aligned output (recursively sorted keys, no insignificant
+whitespace) so both sides sign byte-identical bytes regardless of key insertion order.
+
+## Envelope format
+
+```ts
+interface Envelope {
+  v: number;          // format version (1)
+  suite: string;      // 'X25519-HKDF-SHA256/AES-256-GCM'
+  iv: string;         // base64url payload nonce
+  ciphertext: string; // base64url ciphertext ‖ tag
+  recipients: Record<string, { epk: string; key: string }>; // keyed by recipientId
+}
+```
+
+`serializeEnvelope` packs this into `magic ‖ version ‖ suite ‖ …` and base64url-encodes it;
+`deserializeEnvelope` validates the header and rejects anything it doesn't recognize.

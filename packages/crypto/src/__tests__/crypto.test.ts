@@ -1,418 +1,298 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import {
   canonicalJson,
   decrypt,
-  type EncryptedPayload,
+  decryptFromBlob,
+  deserializeEnvelope,
   encrypt,
-  exportPublicKey,
-  generateKeyPair,
-  importPublicKey,
+  encryptToBlob,
+  generateEncryptionKeyPair,
+  generateSigningKeyPair,
   type KeyPair,
-  type RecipientKey,
+  serializeEnvelope,
   signChallenge,
   verifyChallenge,
 } from '../index.js';
 
-describe('@coinfra/crypto', () => {
-  // ── Key generation ──────────────────────────────────
+// Shared key material generated once — keygen is cheap for X25519/Ed25519 but
+// we still avoid regenerating it for every case.
+let alice: KeyPair;
+let bob: KeyPair;
+let carol: KeyPair;
+let signer: KeyPair;
 
-  describe('generateKeyPair', () => {
-    it('should generate valid RSA key pair', () => {
-      const kp = generateKeyPair();
-      expect(kp.publicKey).toContain('BEGIN PUBLIC KEY');
-      expect(kp.privateKey).toContain('BEGIN PRIVATE KEY');
-    });
+beforeAll(async () => {
+  [alice, bob, carol, signer] = await Promise.all([
+    generateEncryptionKeyPair(),
+    generateEncryptionKeyPair(),
+    generateEncryptionKeyPair(),
+    generateSigningKeyPair(),
+  ]);
+});
 
-    it('should generate unique keys each time', () => {
-      const kp1 = generateKeyPair();
-      const kp2 = generateKeyPair();
-      expect(kp1.publicKey).not.toBe(kp2.publicKey);
-      expect(kp1.privateKey).not.toBe(kp2.privateKey);
-    });
+describe('key generation', () => {
+  it('produces base64url public and private strings', () => {
+    expect(typeof alice.publicKey).toBe('string');
+    expect(typeof alice.privateKey).toBe('string');
+    expect(alice.publicKey).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(alice.privateKey).toMatch(/^[A-Za-z0-9_-]+$/);
   });
 
-  // ── Basic encrypt/decrypt ─────────────────────────
-
-  describe('encrypt + decrypt', () => {
-    let kp: KeyPair;
-    const deviceId = 'dev_test';
-
-    beforeEach(() => {
-      kp = generateKeyPair();
-    });
-
-    it('should encrypt and decrypt a simple message', () => {
-      const recipients: RecipientKey[] = [{ deviceId, publicKey: kp.publicKey }];
-      const payload = encrypt('hello world', recipients);
-      const result = decrypt(payload, deviceId, kp.privateKey);
-      expect(result).toBe('hello world');
-    });
-
-    it('should encrypt and decrypt empty string', () => {
-      const recipients: RecipientKey[] = [{ deviceId, publicKey: kp.publicKey }];
-      const payload = encrypt('', recipients);
-      const result = decrypt(payload, deviceId, kp.privateKey);
-      expect(result).toBe('');
-    });
-
-    it('should encrypt and decrypt unicode content', () => {
-      const msg = '🔐 coinfra says: 你好世界! Ωmega ñoño';
-      const recipients: RecipientKey[] = [{ deviceId, publicKey: kp.publicKey }];
-      const payload = encrypt(msg, recipients);
-      expect(decrypt(payload, deviceId, kp.privateKey)).toBe(msg);
-    });
-
-    it('should encrypt and decrypt large content (100KB)', () => {
-      const msg = 'x'.repeat(100_000);
-      const recipients: RecipientKey[] = [{ deviceId, publicKey: kp.publicKey }];
-      const payload = encrypt(msg, recipients);
-      expect(decrypt(payload, deviceId, kp.privateKey)).toBe(msg);
-    });
-
-    it('should encrypt and decrypt JSON content', () => {
-      const obj = { type: 'message', payload: { content: 'I fixed the bug in auth.js' } };
-      const msg = JSON.stringify(obj);
-      const recipients: RecipientKey[] = [{ deviceId, publicKey: kp.publicKey }];
-      const payload = encrypt(msg, recipients);
-      const decrypted = JSON.parse(decrypt(payload, deviceId, kp.privateKey));
-      expect(decrypted).toEqual(obj);
-    });
-
-    it('should produce different ciphertext for same plaintext (random IV)', () => {
-      const recipients: RecipientKey[] = [{ deviceId, publicKey: kp.publicKey }];
-      const p1 = encrypt('same message', recipients);
-      const p2 = encrypt('same message', recipients);
-      expect(p1.ciphertext).not.toBe(p2.ciphertext);
-      expect(p1.iv).not.toBe(p2.iv);
-    });
+  it('generates distinct key pairs each call', async () => {
+    const a = await generateEncryptionKeyPair();
+    const b = await generateEncryptionKeyPair();
+    expect(a.publicKey).not.toBe(b.publicKey);
+    expect(a.privateKey).not.toBe(b.privateKey);
   });
 
-  // ── Multi-recipient ───────────────────────────────
-
-  describe('multi-recipient encryption', () => {
-    it('should encrypt for two recipients, each can decrypt independently', () => {
-      const kp1 = generateKeyPair();
-      const kp2 = generateKeyPair();
-      const recipients: RecipientKey[] = [
-        { deviceId: 'dev_phone', publicKey: kp1.publicKey },
-        { deviceId: 'dev_browser', publicKey: kp2.publicKey },
-      ];
-
-      const payload = encrypt('secret message', recipients);
-
-      // Both should have their own wrapped key
-      expect(payload.keys.dev_phone).toBeTruthy();
-      expect(payload.keys.dev_browser).toBeTruthy();
-      expect(payload.keys.dev_phone).not.toBe(payload.keys.dev_browser);
-
-      // Both can decrypt
-      expect(decrypt(payload, 'dev_phone', kp1.privateKey)).toBe('secret message');
-      expect(decrypt(payload, 'dev_browser', kp2.privateKey)).toBe('secret message');
-
-      // Ciphertext is the same (deduplicated)
-      // Both recipients decode the same ciphertext with different AES keys
-    });
-
-    it('should encrypt for five recipients', { timeout: 30_000 }, () => {
-      const pairs = Array.from({ length: 5 }, (_, i) => ({
-        kp: generateKeyPair(),
-        deviceId: `dev_${i}`,
-      }));
-      const recipients = pairs.map((p) => ({ deviceId: p.deviceId, publicKey: p.kp.publicKey }));
-
-      const payload = encrypt('broadcast message', recipients);
-      expect(Object.keys(payload.keys)).toHaveLength(5);
-
-      for (const p of pairs) {
-        expect(decrypt(payload, p.deviceId, p.kp.privateKey)).toBe('broadcast message');
-      }
-    });
+  it('produces a compact 32-byte X25519 public key', () => {
+    // 32 bytes -> 43 base64url chars (unpadded)
+    expect(alice.publicKey.length).toBe(43);
   });
 
-  // ── Security properties ───────────────────────────
-
-  describe('security', () => {
-    it('should fail to decrypt with wrong private key', () => {
-      const kp1 = generateKeyPair();
-      const kp2 = generateKeyPair();
-      const payload = encrypt('secret', [{ deviceId: 'dev_1', publicKey: kp1.publicKey }]);
-
-      expect(() => decrypt(payload, 'dev_1', kp2.privateKey)).toThrow();
-    });
-
-    it('should fail to decrypt for non-existent device', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('secret', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-
-      expect(() => decrypt(payload, 'dev_unknown', kp.privateKey)).toThrow(
-        'No encrypted key found',
-      );
-    });
-
-    it('should detect tampered ciphertext (GCM auth)', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('secret', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-
-      // Tamper with ciphertext
-      const buf = Buffer.from(payload.ciphertext, 'base64');
-      buf[0] ^= 0xff;
-      const tampered: EncryptedPayload = { ...payload, ciphertext: buf.toString('base64') };
-
-      expect(() => decrypt(tampered, 'dev_1', kp.privateKey)).toThrow();
-    });
-
-    it('should detect tampered IV', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('secret', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-
-      const buf = Buffer.from(payload.iv, 'base64');
-      buf[0] ^= 0xff;
-      const tampered: EncryptedPayload = { ...payload, iv: buf.toString('base64') };
-
-      expect(() => decrypt(tampered, 'dev_1', kp.privateKey)).toThrow();
-    });
-
-    it('should detect tampered auth tag', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('secret', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-
-      const buf = Buffer.from(payload.tag, 'base64');
-      buf[0] ^= 0xff;
-      const tampered: EncryptedPayload = { ...payload, tag: buf.toString('base64') };
-
-      expect(() => decrypt(tampered, 'dev_1', kp.privateKey)).toThrow();
-    });
-
-    it('should detect tampered wrapped key', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('secret', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-
-      const buf = Buffer.from(payload.keys.dev_1, 'base64');
-      buf[0] ^= 0xff;
-      const tampered: EncryptedPayload = {
-        ...payload,
-        keys: { dev_1: buf.toString('base64') },
-      };
-
-      expect(() => decrypt(tampered, 'dev_1', kp.privateKey)).toThrow();
-    });
-
-    it('should throw when encrypting with zero recipients', () => {
-      expect(() => encrypt('message', [])).toThrow('At least one recipient');
-    });
-
-    it('recipient A cannot decrypt message for recipient B', () => {
-      const kpA = generateKeyPair();
-      const kpB = generateKeyPair();
-      const payload = encrypt('for B only', [{ deviceId: 'dev_B', publicKey: kpB.publicKey }]);
-
-      // A doesn't have a key entry
-      expect(() => decrypt(payload, 'dev_A', kpA.privateKey)).toThrow('No encrypted key found');
-
-      // A can't use B's wrapped key with A's private key
-      expect(() => decrypt(payload, 'dev_B', kpA.privateKey)).toThrow();
-    });
-  });
-
-  // ── Key export/import ─────────────────────────────
-
-  describe('key export/import', () => {
-    it('should round-trip public key through export/import', () => {
-      const kp = generateKeyPair();
-      const exported = exportPublicKey(kp.publicKey);
-      const imported = importPublicKey(exported);
-
-      // Verify the imported key works for encryption
-      const payload = encrypt('test', [{ deviceId: 'dev_1', publicKey: imported }]);
-      expect(decrypt(payload, 'dev_1', kp.privateKey)).toBe('test');
-    });
-
-    it('exported key should be compact (no PEM headers)', () => {
-      const kp = generateKeyPair();
-      const exported = exportPublicKey(kp.publicKey);
-      expect(exported).not.toContain('BEGIN');
-      expect(exported).not.toContain('END');
-      expect(exported).not.toContain('\n');
-    });
-
-    it('should handle empty key string', () => {
-      const imported = importPublicKey('');
-      expect(imported).toContain('BEGIN PUBLIC KEY');
-      expect(imported).toContain('END PUBLIC KEY');
-    });
-
-    it('imported key should be valid PEM', () => {
-      const kp = generateKeyPair();
-      const exported = exportPublicKey(kp.publicKey);
-      const imported = importPublicKey(exported);
-      expect(imported).toContain('-----BEGIN PUBLIC KEY-----');
-      expect(imported).toContain('-----END PUBLIC KEY-----');
-    });
-  });
-
-  // ── Payload structure ─────────────────────────────
-
-  describe('payload structure', () => {
-    it('should produce valid base64 in all fields', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('test', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-
-      // All fields should be valid base64
-      expect(() => Buffer.from(payload.iv, 'base64')).not.toThrow();
-      expect(() => Buffer.from(payload.ciphertext, 'base64')).not.toThrow();
-      expect(() => Buffer.from(payload.tag, 'base64')).not.toThrow();
-      expect(() => Buffer.from(payload.keys.dev_1, 'base64')).not.toThrow();
-    });
-
-    it('should be JSON-serializable (for WebSocket transport)', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('test message', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-
-      const json = JSON.stringify(payload);
-      const parsed = JSON.parse(json) as EncryptedPayload;
-
-      // Decrypt from parsed JSON
-      expect(decrypt(parsed, 'dev_1', kp.privateKey)).toBe('test message');
-    });
-
-    it('IV should be 12 bytes (96 bits for GCM)', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('test', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-      expect(Buffer.from(payload.iv, 'base64').length).toBe(12);
-    });
-
-    it('auth tag should be 16 bytes', () => {
-      const kp = generateKeyPair();
-      const payload = encrypt('test', [{ deviceId: 'dev_1', publicKey: kp.publicKey }]);
-      expect(Buffer.from(payload.tag, 'base64').length).toBe(16);
-    });
-  });
-
-  // ── Challenge-response signing ────────────────────
-
-  describe('challenge-response', () => {
-    it('should sign and verify a nonce', () => {
-      const kp = generateKeyPair();
-      const nonce = 'random-nonce-12345';
-      const signature = signChallenge(nonce, kp.privateKey);
-      expect(verifyChallenge(nonce, signature, kp.publicKey)).toBe(true);
-    });
-
-    it('should reject wrong nonce', () => {
-      const kp = generateKeyPair();
-      const signature = signChallenge('original-nonce', kp.privateKey);
-      expect(verifyChallenge('different-nonce', signature, kp.publicKey)).toBe(false);
-    });
-
-    it('should reject wrong public key', () => {
-      const kp1 = generateKeyPair();
-      const kp2 = generateKeyPair();
-      const signature = signChallenge('nonce', kp1.privateKey);
-      expect(verifyChallenge('nonce', signature, kp2.publicKey)).toBe(false);
-    });
-
-    it('should work with exported/imported keys', () => {
-      const kp = generateKeyPair();
-      const exported = exportPublicKey(kp.publicKey);
-      const imported = importPublicKey(exported);
-      const signature = signChallenge('test-nonce', kp.privateKey);
-      expect(verifyChallenge('test-nonce', signature, imported)).toBe(true);
-    });
-  });
-
-  // ── Performance sanity ────────────────────────────
-
-  describe('performance', () => {
-    it('should encrypt/decrypt 500 small messages in under 10 seconds', () => {
-      const kp = generateKeyPair();
-      const recipients: RecipientKey[] = [{ deviceId: 'dev_1', publicKey: kp.publicKey }];
-
-      const start = Date.now();
-      for (let i = 0; i < 500; i++) {
-        const payload = encrypt(`message ${i}`, recipients);
-        decrypt(payload, 'dev_1', kp.privateKey);
-      }
-      const elapsed = Date.now() - start;
-      expect(elapsed).toBeLessThan(10000);
-    });
-  });
-
-  // ── canonicalJson ─────────────────────────────────────
-
-  describe('canonicalJson', () => {
-    it('sorts keys lexicographically', () => {
-      const a = canonicalJson({ b: 2, a: 1, c: 3 });
-      const b = canonicalJson({ c: 3, a: 1, b: 2 });
-      expect(a).toBe(b);
-      expect(a).toBe('{"a":1,"b":2,"c":3}');
-    });
-
-    it('produces a string with no whitespace between tokens', () => {
-      // The structural JSON has no whitespace — values can contain spaces.
-      const s = canonicalJson({ x: 1, y: 'hi' });
-      expect(s).toBe('{"x":1,"y":"hi"}');
-    });
-
-    it('is stable across insertion-order variations of the same logical payload', () => {
-      const payload1 = {
-        ver: 1,
-        iss: 'coinfra',
-        sub: 'u',
-        did: 'd',
-        iat: 1,
-        exp: 2,
-        quota_seconds: 7200,
-        resource: 'svc/resource',
-        jti: 'j',
-      };
-      const payload2 = {
-        jti: 'j',
-        resource: 'svc/resource',
-        quota_seconds: 7200,
-        exp: 2,
-        iat: 1,
-        did: 'd',
-        sub: 'u',
-        iss: 'coinfra',
-        ver: 1,
-      };
-      expect(canonicalJson(payload1)).toBe(canonicalJson(payload2));
-    });
-
-    it('round-trips through signChallenge → verifyChallenge', () => {
-      const kp = generateKeyPair();
-      const payload = {
-        ver: 1,
-        iss: 'coinfra',
-        sub: 'user_abc',
-        did: 'dev_xyz',
-        iat: 1000,
-        exp: 2000,
-        quota_seconds: 3600,
-        resource: 'svc/resource',
-        jti: 'lease_1',
-      };
-      const canonical = canonicalJson(payload);
-      const sig = signChallenge(canonical, kp.privateKey);
-      expect(verifyChallenge(canonical, sig, kp.publicKey)).toBe(true);
-    });
-
-    it('detects tampering (any payload mutation breaks signature)', () => {
-      const kp = generateKeyPair();
-      const payload = {
-        ver: 1,
-        iss: 'coinfra',
-        sub: 'user_abc',
-        did: 'dev_xyz',
-        iat: 1000,
-        exp: 2000,
-        quota_seconds: 3600,
-        resource: 'svc/resource',
-        jti: 'lease_1',
-      };
-      const sig = signChallenge(canonicalJson(payload), kp.privateKey);
-      const tampered = { ...payload, quota_seconds: 7200 };
-      expect(verifyChallenge(canonicalJson(tampered), sig, kp.publicKey)).toBe(false);
-    });
+  it('separates encryption and signing keys', () => {
+    expect(signer.publicKey).not.toBe(alice.publicKey);
   });
 });
+
+describe('encrypt / decrypt', () => {
+  it('round-trips a message for a single recipient', async () => {
+    const envelope = await encrypt('hello world', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+    ]);
+    const plaintext = await decrypt(envelope, 'alice', alice.privateKey);
+    expect(plaintext).toBe('hello world');
+  });
+
+  it('encrypts once but every recipient can decrypt', async () => {
+    const message = '🔐 coinfra says: shared secret';
+    const envelope = await encrypt(message, [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+      { recipientId: 'bob', publicKey: bob.publicKey },
+      { recipientId: 'carol', publicKey: carol.publicKey },
+    ]);
+
+    expect(await decrypt(envelope, 'alice', alice.privateKey)).toBe(message);
+    expect(await decrypt(envelope, 'bob', bob.privateKey)).toBe(message);
+    expect(await decrypt(envelope, 'carol', carol.privateKey)).toBe(message);
+  });
+
+  it('carries version and suite metadata', async () => {
+    const envelope = await encrypt('x', [{ recipientId: 'alice', publicKey: alice.publicKey }]);
+    expect(envelope.v).toBe(1);
+    expect(envelope.suite).toBe('X25519-HKDF-SHA256/AES-256-GCM');
+  });
+
+  it('gives each recipient an independent ephemeral key and wrapped key', async () => {
+    const envelope = await encrypt('multi', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+      { recipientId: 'bob', publicKey: bob.publicKey },
+    ]);
+    const a = envelope.recipients.alice!;
+    const b = envelope.recipients.bob!;
+    expect(a.epk).not.toBe(b.epk);
+    expect(a.key).not.toBe(b.key);
+  });
+
+  it('produces fresh ciphertext for identical plaintext', async () => {
+    const recipients = [{ recipientId: 'alice', publicKey: alice.publicKey }];
+    const one = await encrypt('same', recipients);
+    const two = await encrypt('same', recipients);
+    expect(one.ciphertext).not.toBe(two.ciphertext);
+    expect(one.iv).not.toBe(two.iv);
+  });
+
+  it('round-trips an empty string', async () => {
+    const envelope = await encrypt('', [{ recipientId: 'alice', publicKey: alice.publicKey }]);
+    expect(await decrypt(envelope, 'alice', alice.privateKey)).toBe('');
+  });
+
+  it('round-trips unicode and emoji', async () => {
+    const message = '你好世界 🌍 مرحبا Здравствуйте 🦀';
+    const envelope = await encrypt(message, [{ recipientId: 'alice', publicKey: alice.publicKey }]);
+    expect(await decrypt(envelope, 'alice', alice.privateKey)).toBe(message);
+  });
+
+  it('round-trips a large payload', async () => {
+    const message = 'A'.repeat(200_000);
+    const envelope = await encrypt(message, [{ recipientId: 'alice', publicKey: alice.publicKey }]);
+    expect(await decrypt(envelope, 'alice', alice.privateKey)).toBe(message);
+  });
+
+  it('rejects zero recipients', async () => {
+    await expect(encrypt('x', [])).rejects.toThrow(/at least one recipient/i);
+  });
+});
+
+describe('decrypt failures', () => {
+  it('throws when the recipient id is unknown', async () => {
+    const envelope = await encrypt('secret', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+    ]);
+    await expect(decrypt(envelope, 'stranger', alice.privateKey)).rejects.toThrow(
+      /no encrypted key/i,
+    );
+  });
+
+  it('fails when decrypting with the wrong private key', async () => {
+    const envelope = await encrypt('secret', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+    ]);
+    // bob's key is not the one wrapped for "alice"
+    await expect(decrypt(envelope, 'alice', bob.privateKey)).rejects.toThrow();
+  });
+
+  it('fails when the payload ciphertext is tampered', async () => {
+    const envelope = await encrypt('secret', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+    ]);
+    const flipped = flipBase64urlByte(envelope.ciphertext);
+    await expect(
+      decrypt({ ...envelope, ciphertext: flipped }, 'alice', alice.privateKey),
+    ).rejects.toThrow();
+  });
+
+  it('fails when a recipient wrapped key is tampered', async () => {
+    const envelope = await encrypt('secret', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+    ]);
+    const entry = envelope.recipients.alice!;
+    const tampered = {
+      ...envelope,
+      recipients: { alice: { ...entry, key: flipBase64urlByte(entry.key) } },
+    };
+    await expect(decrypt(tampered, 'alice', alice.privateKey)).rejects.toThrow();
+  });
+});
+
+describe('serialize / deserialize envelope', () => {
+  it('round-trips through the compact binary form and still decrypts', async () => {
+    const envelope = await encrypt('via blob', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+      { recipientId: 'bob', publicKey: bob.publicKey },
+    ]);
+    const blob = serializeEnvelope(envelope);
+    expect(typeof blob).toBe('string');
+    expect(blob).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    const restored = deserializeEnvelope(blob);
+    expect(restored.v).toBe(envelope.v);
+    expect(restored.suite).toBe(envelope.suite);
+    expect(await decrypt(restored, 'alice', alice.privateKey)).toBe('via blob');
+    expect(await decrypt(restored, 'bob', bob.privateKey)).toBe('via blob');
+  });
+
+  it('rejects a blob that is not a coinfra envelope', () => {
+    expect(() => deserializeEnvelope('AAAAAAAA')).toThrow(/not a coinfra/i);
+  });
+
+  it('rejects a truncated blob', async () => {
+    const good = serializeEnvelope(
+      await encrypt('x', [{ recipientId: 'alice', publicKey: alice.publicKey }]),
+    );
+    // Cut it in half to truncate.
+    expect(() => deserializeEnvelope(good.slice(0, Math.floor(good.length / 2)))).toThrow();
+  });
+});
+
+describe('encryptToBlob / decryptFromBlob', () => {
+  it('round-trips a self-contained blob', async () => {
+    const blob = await encryptToBlob('one-shot', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+    ]);
+    expect(typeof blob).toBe('string');
+    expect(await decryptFromBlob(blob, 'alice', alice.privateKey)).toBe('one-shot');
+  });
+
+  it('supports multiple recipients from a single blob', async () => {
+    const blob = await encryptToBlob('group', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+      { recipientId: 'bob', publicKey: bob.publicKey },
+    ]);
+    expect(await decryptFromBlob(blob, 'alice', alice.privateKey)).toBe('group');
+    expect(await decryptFromBlob(blob, 'bob', bob.privateKey)).toBe('group');
+  });
+
+  it('preserves recipient ids with unicode characters', async () => {
+    const blob = await encryptToBlob('naming', [
+      { recipientId: '设备-01 🦄', publicKey: alice.publicKey },
+    ]);
+    expect(await decryptFromBlob(blob, '设备-01 🦄', alice.privateKey)).toBe('naming');
+  });
+});
+
+describe('challenge-response signing (Ed25519)', () => {
+  it('verifies a valid signature', async () => {
+    const nonce = 'random-challenge-123';
+    const sig = await signChallenge(nonce, signer.privateKey);
+    expect(await verifyChallenge(nonce, sig, signer.publicKey)).toBe(true);
+  });
+
+  it('is deterministic (Ed25519)', async () => {
+    const nonce = 'deterministic';
+    const a = await signChallenge(nonce, signer.privateKey);
+    const b = await signChallenge(nonce, signer.privateKey);
+    expect(a).toBe(b);
+  });
+
+  it('rejects a signature over a different nonce', async () => {
+    const sig = await signChallenge('nonce-a', signer.privateKey);
+    expect(await verifyChallenge('nonce-b', sig, signer.publicKey)).toBe(false);
+  });
+
+  it('rejects a signature from a different key', async () => {
+    const other = await generateSigningKeyPair();
+    const sig = await signChallenge('nonce', signer.privateKey);
+    expect(await verifyChallenge('nonce', sig, other.publicKey)).toBe(false);
+  });
+
+  it('rejects a tampered signature', async () => {
+    const sig = await signChallenge('nonce', signer.privateKey);
+    expect(await verifyChallenge('nonce', flipBase64urlByte(sig), signer.publicKey)).toBe(false);
+  });
+
+  it('returns false (never throws) on malformed input', async () => {
+    expect(await verifyChallenge('nonce', 'not-a-real-sig', signer.publicKey)).toBe(false);
+    expect(await verifyChallenge('nonce', '!!!', '###')).toBe(false);
+  });
+});
+
+describe('canonicalJson', () => {
+  it('sorts top-level keys', () => {
+    expect(canonicalJson({ b: 1, a: 2, c: 3 })).toBe('{"a":2,"b":1,"c":3}');
+  });
+
+  it('is independent of insertion order', () => {
+    expect(canonicalJson({ a: 1, b: 2 })).toBe(canonicalJson({ b: 2, a: 1 }));
+  });
+
+  it('recursively sorts nested objects', () => {
+    expect(canonicalJson({ z: { y: 1, x: 2 }, a: 3 })).toBe('{"a":3,"z":{"x":2,"y":1}}');
+  });
+
+  it('preserves array order but canonicalizes array elements', () => {
+    expect(canonicalJson({ list: [{ b: 1, a: 2 }, 3] })).toBe('{"list":[{"a":2,"b":1},3]}');
+  });
+
+  it('handles null and nested primitives', () => {
+    expect(canonicalJson({ a: null, b: 'x', c: true })).toBe('{"a":null,"b":"x","c":true}');
+  });
+
+  it('supports canonical signing round-trips regardless of key order', async () => {
+    const payload = { resource: 'svc/resource', iss: 'coinfra', exp: 1000 };
+    const reordered = { exp: 1000, iss: 'coinfra', resource: 'svc/resource' };
+    const sig = await signChallenge(canonicalJson(payload), signer.privateKey);
+    expect(await verifyChallenge(canonicalJson(reordered), sig, signer.publicKey)).toBe(true);
+  });
+});
+
+// ── helpers ─────────────────────────────────────────────
+
+function flipBase64urlByte(b64url: string): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const chars = b64url.split('');
+  const i = Math.floor(chars.length / 2);
+  const current = alphabet.indexOf(chars[i]!);
+  chars[i] = alphabet[(current + 1) % alphabet.length]!;
+  return chars.join('');
+}
