@@ -1,4 +1,4 @@
-# @kraki/pulse
+# @coinfra/pulse
 
 **The delivery contract: message sequencing, acks, and cursor-based resume for a
 breakable WebSocket channel. Pure logic, no I/O.**
@@ -12,8 +12,8 @@ half-open / mobile-handoff case).
 Pulse assumes **no application context**. It does not know what a session,
 device, message type, user, or approval is — one flat sequence stream per
 direction, carrying bytes it never inspects. Multiplexing, identity, auth,
-pairing, and encryption all live *above* pulse. Every Kraki client (the Node
-tentacle, the web arm, the iOS arm) speaks pulse; each supplies its own
+pairing, and encryption all live *above* pulse. Every client (a backend
+service, a web app, a native app) speaks pulse; each supplies its own
 transport and storage.
 
 ## Layout
@@ -24,7 +24,7 @@ spec/         the single source of truth (language-neutral)
   FIXTURES.md   byte-exact frame encodings, explained
 fixtures/
   wire.json     machine-readable fixtures — loaded by BOTH test suites
-ts/           TypeScript implementation (npm: @kraki/pulse)
+src/          TypeScript implementation (npm: @coinfra/pulse)
 swift/        Swift implementation (SwiftPM: Pulse)
 ```
 
@@ -65,11 +65,11 @@ persistence (durability is an adapter capability via the snapshot API). Wrap it.
 
 ```bash
 # TypeScript
-pnpm --filter @kraki/pulse test      # 56 tests: wire + scenarios + real-socket smoke
-pnpm --filter @kraki/pulse build
+pnpm --filter @coinfra/pulse test    # 92 tests: wire + scenarios + real-socket smoke
+pnpm --filter @coinfra/pulse build
 
 # Swift (requires a Swift toolchain)
-cd swift && swift test               # 25 tests: wire conformance + scenarios
+cd swift && swift test               # 47 tests: wire conformance + scenarios
 
 # After editing fixtures, resync the Swift copy (SwiftPM won't follow symlinks):
 swift/sync-fixtures.sh

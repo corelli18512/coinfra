@@ -6,7 +6,7 @@
  * from a persisted store after a simulated restart, mixed durable/non-durable
  * behavior, exactly-once + ordering under durability, and retention expiry.
  *
- * Everything is anonymous A/B endpoints — ZERO kraki concepts. `store`/`unstore`
+ * Everything is anonymous A/B endpoints — ZERO application concepts. `store`/`unstore`
  * carry only seq + bytes; the core never sees a destination.
  */
 

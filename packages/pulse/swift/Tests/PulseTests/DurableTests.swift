@@ -3,7 +3,7 @@ import XCTest
 @testable import Pulse
 
 /// Durable outbox — Swift mirror of the TS durable suite (spec §8.1).
-/// Anonymous A/B endpoints, zero kraki concepts. Verifies capability
+/// Anonymous A/B endpoints, zero application concepts. Verifies capability
 /// negotiation, the wire durable bit gated on peer support, store/unstore,
 /// resume-across-restart, mixed durable/plain, exactly-once, and retention.
 final class DurableTests: XCTestCase {
