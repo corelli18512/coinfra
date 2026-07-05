@@ -10,12 +10,13 @@ once, reuse it everywhere.
 
 | Package | What |
 |---|---|
+| [`@coinfra/crypto`](packages/crypto) | Hybrid RSA-OAEP + AES-256-GCM encryption, multi-recipient blobs, and challenge-response signing. |
 | [`@coinfra/pulse`](packages/pulse) | Reliable message delivery over a breakable WebSocket. |
 
 ## Toolchain
 
-pnpm 10 workspaces + catalog · Turborepo 2 · TypeScript 6 (ESM-only) · tsdown (Rolldown) ·
-Biome 2 · Vitest 4 · Changesets · Node 24. Publishing via npm Trusted Publishing (OIDC).
+pnpm 11 workspaces + catalog · Turborepo 2 · TypeScript 7 native (`tsgo`) · Biome 2 ·
+Vitest 4 · Changesets · Node 26. Publishing via npm Trusted Publishing (OIDC).
 
 ## Develop
 

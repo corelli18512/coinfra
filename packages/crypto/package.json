@@ -1,0 +1,38 @@
+{
+  "name": "@coinfra/crypto",
+  "version": "0.2.1",
+  "description": "Hybrid E2E encryption primitives — RSA-OAEP key wrapping + AES-256-GCM, multi-recipient, blob encoding, and challenge-response signing. Node.js, no dependencies.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsgo",
+    "dev": "tsgo --watch",
+    "typecheck": "tsgo --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist .turbo"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "vitest": "catalog:"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/corelli18512/coinfra.git",
+    "directory": "packages/crypto"
+  }
+}

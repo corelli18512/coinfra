@@ -1,11 +1,26 @@
 packages:
   - "packages/*"
 
+onlyBuiltDependencies:
+  - "@biomejs/biome"
+  - esbuild
+
 catalog:
   typescript: ^6.0.3
+  "@typescript/native-preview": 7.0.0-dev.20260705.1
   tsdown: ^0.22.3
   vitest: ^4.1.9
-  "@types/node": ^24
+  "@types/node": ^26
   ws: ^8.18.0
   "@types/ws": ^8.5.0
   fast-check: ^4.8.0
+
+minimumReleaseAgeExclude:
+  - '@typescript/native-preview-darwin-arm64@7.0.0-dev.20260705.1'
+  - '@typescript/native-preview-darwin-x64@7.0.0-dev.20260705.1'
+  - '@typescript/native-preview-linux-arm64@7.0.0-dev.20260705.1'
+  - '@typescript/native-preview-linux-arm@7.0.0-dev.20260705.1'
+  - '@typescript/native-preview-linux-x64@7.0.0-dev.20260705.1'
+  - '@typescript/native-preview-win32-arm64@7.0.0-dev.20260705.1'
+  - '@typescript/native-preview-win32-x64@7.0.0-dev.20260705.1'
+  - '@typescript/native-preview@7.0.0-dev.20260705.1'
