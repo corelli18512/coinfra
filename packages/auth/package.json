@@ -1,6 +1,6 @@
 {
   "name": "@coinfra/auth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The sign-in wheel: Better Auth extended with domestic-China connectors (WeChat, WeCom, SMS OTP) and a coinfra house preset. Embedded library — each app runs it in-process, no standalone identity server.",
   "type": "module",
   "exports": {
