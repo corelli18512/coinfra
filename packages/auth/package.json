@@ -1,0 +1,62 @@
+{
+  "name": "@coinfra/auth",
+  "version": "0.1.0",
+  "description": "The sign-in wheel: Better Auth extended with domestic-China connectors (WeChat, WeCom, SMS OTP) and a coinfra house preset. Embedded library — each app runs it in-process, no standalone identity server.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./wechat": {
+      "types": "./dist/wechat.d.ts",
+      "import": "./dist/wechat.js"
+    },
+    "./wecom": {
+      "types": "./dist/wecom.d.ts",
+      "import": "./dist/wecom.js"
+    },
+    "./sms": {
+      "types": "./dist/sms.d.ts",
+      "import": "./dist/sms.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsgo",
+    "dev": "tsgo --watch",
+    "typecheck": "tsgo --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist .turbo"
+  },
+  "peerDependencies": {
+    "better-auth": ">=1.6.0 <2"
+  },
+  "dependencies": {
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@better-auth/memory-adapter": "catalog:",
+    "@types/node": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "better-auth": "catalog:",
+    "vitest": "catalog:"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/corelli18512/coinfra.git",
+    "directory": "packages/auth"
+  }
+}
