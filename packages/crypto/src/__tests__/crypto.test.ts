@@ -163,6 +163,30 @@ describe('decrypt failures', () => {
     };
     await expect(decrypt(tampered, 'alice', alice.privateKey)).rejects.toThrow();
   });
+
+  it('fails when a recipient entry is relabeled (recipientId is authenticated)', async () => {
+    const envelope = await encrypt('secret', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+    ]);
+    // Move alice's entry under a different id; the wrap AAD no longer matches.
+    const relabeled = {
+      ...envelope,
+      recipients: { mallory: envelope.recipients.alice! },
+    };
+    await expect(decrypt(relabeled, 'mallory', alice.privateKey)).rejects.toThrow();
+  });
+
+  it('rejects an envelope with an unexpected version or suite', async () => {
+    const envelope = await encrypt('secret', [
+      { recipientId: 'alice', publicKey: alice.publicKey },
+    ]);
+    await expect(decrypt({ ...envelope, v: 2 }, 'alice', alice.privateKey)).rejects.toThrow(
+      /unsupported envelope/i,
+    );
+    await expect(
+      decrypt({ ...envelope, suite: 'RSA-OAEP/AES-256-GCM' }, 'alice', alice.privateKey),
+    ).rejects.toThrow(/unsupported envelope/i);
+  });
 });
 
 describe('serialize / deserialize envelope', () => {

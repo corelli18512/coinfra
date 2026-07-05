@@ -84,6 +84,7 @@ const MAGIC_1 = 0x1f;
 const IV_SIZE = 12; // 96-bit GCM nonce
 const CEK_SIZE = 32; // 256-bit content encryption key
 const HKDF_INFO_LABEL = 'coinfra-crypto/v1 kek';
+const CHALLENGE_CONTEXT = 'coinfra-crypto/v1 challenge\n';
 
 // ── base64url (runtime-agnostic) ────────────────────────
 
@@ -150,15 +151,21 @@ function fromBase64url(text: string): Bytes {
     out[o++] = n & 0xff;
   }
   if (rem === 2) {
-    const n = (dec(text.charCodeAt(i)) << 18) | (dec(text.charCodeAt(i + 1)) << 12);
-    out[o++] = (n >> 16) & 0xff;
+    const c0 = dec(text.charCodeAt(i));
+    const c1 = dec(text.charCodeAt(i + 1));
+    if ((c1 & 0x0f) !== 0) {
+      throw new Error('Non-canonical base64url string');
+    }
+    out[o++] = ((c0 << 2) | (c1 >> 4)) & 0xff;
   } else if (rem === 3) {
-    const n =
-      (dec(text.charCodeAt(i)) << 18) |
-      (dec(text.charCodeAt(i + 1)) << 12) |
-      (dec(text.charCodeAt(i + 2)) << 6);
-    out[o++] = (n >> 16) & 0xff;
-    out[o++] = (n >> 8) & 0xff;
+    const c0 = dec(text.charCodeAt(i));
+    const c1 = dec(text.charCodeAt(i + 1));
+    const c2 = dec(text.charCodeAt(i + 2));
+    if ((c2 & 0x03) !== 0) {
+      throw new Error('Non-canonical base64url string');
+    }
+    out[o++] = ((c0 << 2) | (c1 >> 4)) & 0xff;
+    out[o++] = ((c1 << 4) | (c2 >> 2)) & 0xff;
   }
   return out;
 }
@@ -231,6 +238,16 @@ function importX25519Private(privateKey: string): Promise<CryptoKey> {
 
 // ── Key encapsulation (HPKE-style) ──────────────────────
 
+/** Additional authenticated data binding a wrapped key to its ephemeral key and recipient. */
+function wrapAad(epkRaw: Bytes, recipientId: string): Bytes {
+  return concatBytes(epkRaw, utf8(recipientId));
+}
+
+/** Additional authenticated data binding the payload to this exact suite + version. */
+function contentAad(): Bytes {
+  return utf8(`${SUITE_NAME}#${ENVELOPE_VERSION}`);
+}
+
 async function deriveKek(sharedSecret: Bytes, epkRaw: Bytes): Promise<CryptoKey> {
   const ikm = await subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
   const info = concatBytes(textEncoder.encode(HKDF_INFO_LABEL), epkRaw);
@@ -245,7 +262,11 @@ async function deriveKek(sharedSecret: Bytes, epkRaw: Bytes): Promise<CryptoKey>
   ]);
 }
 
-async function wrapForRecipient(cek: Bytes, recipientPublicKey: string): Promise<RecipientEntry> {
+async function wrapForRecipient(
+  cek: Bytes,
+  recipientId: string,
+  recipientPublicKey: string,
+): Promise<RecipientEntry> {
   const ephemeral = (await subtle.generateKey({ name: 'X25519' }, true, [
     'deriveBits',
   ])) as unknown as KeyPairHandle;
@@ -257,11 +278,21 @@ async function wrapForRecipient(cek: Bytes, recipientPublicKey: string): Promise
   const kek = await deriveKek(sharedSecret, epkRaw);
 
   const iv = randomBytes(IV_SIZE);
-  const wrapped = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv }, kek, cek));
+  const wrapped = new Uint8Array(
+    await subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: wrapAad(epkRaw, recipientId) },
+      kek,
+      cek,
+    ),
+  );
   return { epk: toBase64url(epkRaw), key: toBase64url(concatBytes(iv, wrapped)) };
 }
 
-async function unwrapContentKey(entry: RecipientEntry, privateKey: string): Promise<Bytes> {
+async function unwrapContentKey(
+  entry: RecipientEntry,
+  recipientId: string,
+  privateKey: string,
+): Promise<Bytes> {
   const epkRaw = fromBase64url(entry.epk);
   const ephemeralPub = await importX25519Public(entry.epk);
   const recipientPriv = await importX25519Private(privateKey);
@@ -273,7 +304,13 @@ async function unwrapContentKey(entry: RecipientEntry, privateKey: string): Prom
   const raw = fromBase64url(entry.key);
   const iv = raw.subarray(0, IV_SIZE);
   const ciphertext = raw.subarray(IV_SIZE);
-  return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv }, kek, ciphertext));
+  return new Uint8Array(
+    await subtle.decrypt(
+      { name: 'AES-GCM', iv, additionalData: wrapAad(epkRaw, recipientId) },
+      kek,
+      ciphertext,
+    ),
+  );
 }
 
 // ── Encryption ──────────────────────────────────────────
@@ -295,12 +332,20 @@ export async function encrypt(plaintext: string, recipients: Recipient[]): Promi
   const contentKey = await subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
   const iv = randomBytes(IV_SIZE);
   const ciphertext = new Uint8Array(
-    await subtle.encrypt({ name: 'AES-GCM', iv }, contentKey, utf8(plaintext)),
+    await subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: contentAad() },
+      contentKey,
+      utf8(plaintext),
+    ),
   );
 
   const recipientMap: Record<string, RecipientEntry> = {};
   for (const recipient of recipients) {
-    recipientMap[recipient.recipientId] = await wrapForRecipient(cek, recipient.publicKey);
+    recipientMap[recipient.recipientId] = await wrapForRecipient(
+      cek,
+      recipient.recipientId,
+      recipient.publicKey,
+    );
   }
 
   return {
@@ -322,15 +367,19 @@ export async function decrypt(
   recipientId: string,
   privateKey: string,
 ): Promise<string> {
+  if (envelope.v !== ENVELOPE_VERSION || envelope.suite !== SUITE_NAME) {
+    throw new Error(`Unsupported envelope (v${envelope.v}, suite "${envelope.suite}")`);
+  }
+
   const entry = envelope.recipients[recipientId];
   if (!entry) {
     throw new Error(`No encrypted key found for recipient "${recipientId}"`);
   }
 
-  const cek = await unwrapContentKey(entry, privateKey);
+  const cek = await unwrapContentKey(entry, recipientId, privateKey);
   const contentKey = await subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt']);
   const plaintext = await subtle.decrypt(
-    { name: 'AES-GCM', iv: fromBase64url(envelope.iv) },
+    { name: 'AES-GCM', iv: fromBase64url(envelope.iv), additionalData: contentAad() },
     contentKey,
     fromBase64url(envelope.ciphertext),
   );
@@ -344,9 +393,24 @@ export async function decrypt(
  * base64url string (`magic ‖ version ‖ suite ‖ …`).
  */
 export function serializeEnvelope(envelope: Envelope): string {
+  if (envelope.v !== ENVELOPE_VERSION || envelope.suite !== SUITE_NAME) {
+    throw new Error(
+      `Cannot serialize unsupported envelope (v${envelope.v}, suite "${envelope.suite}")`,
+    );
+  }
   const iv = fromBase64url(envelope.iv);
   const ciphertext = fromBase64url(envelope.ciphertext);
   const recipientIds = Object.keys(envelope.recipients);
+
+  if (iv.length > 0xff) {
+    throw new Error('IV too large to serialize');
+  }
+  if (ciphertext.length > 0xffff_ffff) {
+    throw new Error('Ciphertext too large to serialize');
+  }
+  if (recipientIds.length > 0xffff) {
+    throw new Error('Too many recipients to serialize');
+  }
 
   const parts: Uint8Array[] = [];
   const header = new Uint8Array([MAGIC_0, MAGIC_1, ENVELOPE_VERSION, SUITE_ID]);
@@ -359,6 +423,9 @@ export function serializeEnvelope(envelope: Envelope): string {
     const idBytes = textEncoder.encode(id);
     const epk = fromBase64url(entry.epk);
     const key = fromBase64url(entry.key);
+    if (idBytes.length > 0xffff || epk.length > 0xffff || key.length > 0xffff) {
+      throw new Error(`Recipient "${id}" field too large to serialize`);
+    }
     parts.push(u16(idBytes.length), idBytes);
     parts.push(u16(epk.length), epk);
     parts.push(u16(key.length), key);
@@ -483,6 +550,11 @@ export async function decryptFromBlob(
 
 // ── Challenge-response signing (Ed25519) ────────────────
 
+/** Domain-separated bytes to sign, so a challenge signature can't be replayed on another surface. */
+function challengeBytes(nonce: string): Bytes {
+  return concatBytes(utf8(CHALLENGE_CONTEXT), utf8(nonce));
+}
+
 /**
  * Sign a nonce with an Ed25519 private key (for challenge-response auth).
  * Returns the base64url signature.
@@ -495,7 +567,7 @@ export async function signChallenge(nonce: string, privateKey: string): Promise<
     false,
     ['sign'],
   );
-  const sig = await subtle.sign({ name: 'Ed25519' }, key, utf8(nonce));
+  const sig = await subtle.sign({ name: 'Ed25519' }, key, challengeBytes(nonce));
   return toBase64url(new Uint8Array(sig));
 }
 
@@ -516,7 +588,12 @@ export async function verifyChallenge(
       false,
       ['verify'],
     );
-    return await subtle.verify({ name: 'Ed25519' }, key, fromBase64url(signature), utf8(nonce));
+    return await subtle.verify(
+      { name: 'Ed25519' },
+      key,
+      fromBase64url(signature),
+      challengeBytes(nonce),
+    );
   } catch {
     return false;
   }
