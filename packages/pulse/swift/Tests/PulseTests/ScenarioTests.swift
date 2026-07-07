@@ -213,6 +213,36 @@ final class ScenarioTests: XCTestCase {
         XCTAssertEqual(payloads(w2.deliveredB), [2])
     }
 
+    // RESTART-FRESH: producer restarts with no state (new epoch)
+    // peer's stale recvCursor is reset ⇒ new seq=1 message is delivered
+    func testRestartFreshPeerResetsRecvCursor() {
+        let random = { 0.5 }
+        // Phase 1: A sends 3, B receives+acks all.
+        let w1 = World(
+            a: Endpoint(epoch: "A-original", random: random),
+            b: Endpoint(epoch: "phone-B", random: random))
+        w1.connect()
+        for i in 1...3 { w1.sendA(marker(i)) }
+        w1.advance(params.heartbeatIntervalMs + 1)
+        XCTAssertEqual(payloads(w1.deliveredB), [1, 2, 3])
+
+        // Phase 2: A dies + restarts as a fresh endpoint (new epoch, no
+        // restore, sendSeq back to 0). B keeps its state (recvCursor = 3).
+        let bSnap = w1.b.snapshot()
+        w1.disconnect()
+        let w2 = World(
+            a: Endpoint(epoch: "A-reborn", random: random),
+            b: Endpoint(epoch: "phone-B", random: random, restore: bSnap))
+        w2.connect()
+        w2.sendA(marker(99))
+        w2.advance(params.heartbeatIntervalMs + 1)
+
+        // MUST deliver — without the fix B drops seq=1 as duplicate.
+        XCTAssertEqual(payloads(w2.deliveredB), [99])
+        XCTAssertGreaterThanOrEqual(w2.resetsB.count, 1)
+        XCTAssertEqual(w2.resetsB[0].peerEpoch, "A-reborn")
+    }
+
     // WEDGE-FREE
     func testWedgeFreeUnderChurn() {
         let w = makeWorld()

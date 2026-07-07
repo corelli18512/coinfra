@@ -214,9 +214,17 @@ continue after that."
 
 ### 5.3 onBytes(HELLO { peerEpoch', peerRecvEpoch, peerRecvCursor })
 
-This tells us how much of **our outbound** the peer has. Two checks:
+This tells us how much of **our outbound** the peer has. Three checks:
 
 ```
+# (0) Did the peer cold-restart (RESTART-FRESH, §9)?
+# The peer's send-side epoch changed: any recvCursor we hold refers to a
+# stream that no longer exists. Without dropping it, peer's fresh seq=1..N
+# would be silently dropped by §5.3.1's duplicate check (seq <= recvCursor).
+if peerEpoch != "" and peerEpoch' != peerEpoch:
+    recvCursor = 0
+    emit ResetInbound(fromSeq = 1, peerEpoch = peerEpoch')
+
 # (a) Did the peer resume against an epoch we can still serve?
 if peerRecvEpoch != "" and peerRecvEpoch != epoch:
     # peer is trying to resume a stream we no longer have (we cold-started)
@@ -450,7 +458,7 @@ Every row is a scenario the test suites (`ts/src/__tests__`,
 | HALF-OPEN | TCP black-holed, no close event | receive-timeout (`DEAD_AFTER_MS`) ⇒ `CloseConnection` ⇒ reconnect |
 | RECONNECT-STORM | many peers drop at once | full-jitter backoff spreads reconnects; no attempt cap |
 | RESTART-DURABLE | producer restarts, reloads outbox+epoch | epoch preserved ⇒ resume succeeds across restart |
-| RESTART-FRESH | producer restarts with no state (new epoch) | peer's stale-epoch resume ⇒ `RESET` ⇒ `ResetInbound` (explicit) |
+| RESTART-FRESH | producer restarts with no state (new epoch) | consumer sees `peerEpoch` change in HELLO ⇒ resets `recvCursor = 0` and emits `ResetInbound(1, newEpoch)`; peer's fresh seq=1..N are delivered (not dropped as duplicates) |
 | TOO-OLD | consumer resumes past producer's pruned base | `RESET{oldest}` ⇒ `ResetInbound(oldest)`; gap surfaced, never hidden |
 | SLOW-LINK | high one-way propagation delay | delivery is delayed by the propagation time but stays in order, exactly once; outbox drains after the ack's round trip |
 | JITTER | per-frame delay varies, frames can cross | in-order, exactly-once delivery preserved; a hole waits for its predecessor |

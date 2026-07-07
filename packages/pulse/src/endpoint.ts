@@ -204,6 +204,17 @@ export class Endpoint {
 
   private onHello(f: Extract<Frame, { t: 'hello' }>, now: number): Effect[] {
     const effects: Effect[] = [];
+    // Detect peer cold-restart (RESTART-FRESH, spec §9): the peer previously
+    // used a different epoch, now advertises a new one. All state we hold about
+    // the peer's send-side (recvCursor, expected-next-seq) refers to a stream
+    // that no longer exists. If we don't drop it, the peer's fresh seq=1..N
+    // frames will be silently dropped by the duplicate-check in onData
+    // (`f.seq <= recvCursor`). Surface the discontinuity so the app learns
+    // history was dropped, then accept the peer's new stream from seq=1.
+    if (this.peerEpoch !== '' && f.epoch !== this.peerEpoch) {
+      this.recvCursor = 0n;
+      effects.push({ t: 'reset-inbound', fromSeq: 1n, peerEpoch: f.epoch });
+    }
     this.peerEpoch = f.epoch;
     // Learn whether the peer can persist — governs the wire durable bit we set.
     this.peerDurableSupported = f.durableSupported;

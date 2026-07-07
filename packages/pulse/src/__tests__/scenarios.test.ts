@@ -254,6 +254,58 @@ describe('RESTART-DURABLE: reload outbox + epoch, resume across a restart', () =
   });
 });
 
+describe('RESTART-FRESH: producer restarts with no state (new epoch)', () => {
+  it("peer's stale recvCursor is reset ⇒ new seq=1 message is delivered (not dropped as duplicate)", () => {
+    // Real-world scenario (kraki #153 daemon restart):
+    //   A (producer) sends N messages; B (consumer) receives+acks them.
+    //   A dies + restarts with a BRAND NEW epoch and no restored state
+    //   (durable: false, no snapshot). A's send-seq starts back at 1.
+    //   B is unchanged: same process, retained recvCursor = N.
+    // Guarantee (spec §9, RESTART-FRESH):
+    //   "peer's stale-epoch resume ⇒ RESET ⇒ ResetInbound (explicit)"
+    //   → B must observe the fresh epoch, reset its recvCursor to 0,
+    //     emit reset-inbound, and deliver A's new seq=1 message.
+    const random = () => 0.5;
+    const A1_EPOCH = 'A-original';
+    const A2_EPOCH = 'A-reborn';
+
+    // Phase 1: A sends 3 messages, B receives + acks.
+    const w1 = new World(
+      { epoch: A1_EPOCH, random },
+      { epoch: B_EPOCH, random },
+    );
+    w1.connect();
+    for (let i = 1; i <= 3; i++) w1.sendA(marker(i));
+    w1.advance(DEFAULT_PARAMS.heartbeatIntervalMs + 1);
+    expect(payloadsOf(w1.deliveredB)).toEqual([1, 2, 3]);
+
+    // Phase 2: A "dies" and restarts as a fresh endpoint (new epoch, no
+    // restored outbox, sendSeq back to 0). B keeps its state — same peerEpoch
+    // memory, same recvCursor = 3.
+    const bSnapshot = w1.b.snapshot();
+    w1.disconnect();
+    const w2 = new World(
+      { epoch: A2_EPOCH, random },                              // A: fresh, NO restore
+      { epoch: B_EPOCH, random, restore: bSnapshot },           // B: retains state
+    );
+    w2.connect();
+
+    // A sends a new message — from A's view this is seq=1.
+    w2.sendA(marker(99));
+    w2.advance(DEFAULT_PARAMS.heartbeatIntervalMs + 1);
+
+    // MUST deliver — currently FAILS because B sees f.seq=1 <= recvCursor=3
+    // and drops as duplicate. This is the bug the spec RESTART-FRESH row calls
+    // out but the implementation does not enforce.
+    expect(payloadsOf(w2.deliveredB)).toEqual([99]);
+    // AND: B should surface an explicit reset-inbound so the application
+    // knows history was discarded (not silently masked as "no new data").
+    expect(w2.resetsB.length).toBeGreaterThanOrEqual(1);
+    expect(w2.resetsB[0]!.peerEpoch).toBe(A2_EPOCH);
+  });
+});
+
+
 describe('WEDGE-FREE: repeated churn always converges to drained + connected', () => {
   it('survives interleaved disconnects, sends, and blackholes', () => {
     const w = makeWorld();
