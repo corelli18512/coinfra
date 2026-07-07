@@ -26,6 +26,11 @@ public enum Effect: Equatable {
     /// Durable entries with seq ≤ `seqUpTo` are confirmed delivered (or expired)
     /// and may be deleted from durable storage.
     case unstore(seqUpTo: UInt64)
+    /// Observational: the host purged outbox entries via `purge`/`purgeNonDurable`.
+    /// `droppedSeqs` are the seqs that were removed. `reason` echoes the caller
+    /// for logs/metrics. Peers are told to skip these seqs on the next resend
+    /// (as RESET frames), so delivery is not re-attempted.
+    case purged(droppedSeqs: [UInt64], reason: String)
 }
 
 public enum LinkState: Equatable {
@@ -66,7 +71,10 @@ public struct PulseParams {
     }
 }
 
-/// Durable snapshot for restart-durability (spec §10).
+/// Durable snapshot for restart-durability (spec §10). `disconnectedAtMs` is
+/// preserved across snapshot/restore so a host GC policy that keys on
+/// "disconnected too long" survives restart (spec §11). Older snapshots
+/// without the field restore to nil (back-compat).
 public struct Snapshot: Equatable {
     public var epoch: String
     public var sendSeq: UInt64
@@ -74,10 +82,12 @@ public struct Snapshot: Equatable {
     public var outbox: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int)]
     public var recvCursor: UInt64
     public var peerEpoch: String
+    public var disconnectedAtMs: Int?
 
     public static func == (l: Snapshot, r: Snapshot) -> Bool {
         l.epoch == r.epoch && l.sendSeq == r.sendSeq && l.outboxBase == r.outboxBase
             && l.recvCursor == r.recvCursor && l.peerEpoch == r.peerEpoch
+            && l.disconnectedAtMs == r.disconnectedAtMs
             && l.outbox.count == r.outbox.count
             && zip(l.outbox, r.outbox).allSatisfy {
                 $0.seq == $1.seq && $0.payload == $1.payload && $0.durable == $1.durable
@@ -111,6 +121,10 @@ public final class Endpoint {
     private var reconnectAt: Int?
     private var attempt: Int = 0
     private var clock: Int = 0
+    /// Wall-clock ms of the most recent Connected → Disconnected transition,
+    /// or nil while Connected. Preserved across snapshot/restore so a host
+    /// GC policy keyed on "disconnected too long" survives restart. See §11.
+    private var disconnectedAt: Int?
 
     public init(
         epoch: String,
@@ -148,6 +162,7 @@ public final class Endpoint {
     public func onConnected(_ now: Int) -> [Effect] {
         clock = now
         state = .connected
+        disconnectedAt = nil
         attempt = 0
         reconnectAt = nil
         lastRecvAt = now
@@ -164,6 +179,10 @@ public final class Endpoint {
     public func onDisconnected(_ now: Int) -> [Effect] {
         clock = now
         state = .disconnected
+        // Stamp the disconnect time only on the first Connected → Disconnected
+        // transition — repeated calls (e.g. adapter idempotency) must not reset
+        // the age a host GC policy is measuring against. See §11.
+        if disconnectedAt == nil { disconnectedAt = now }
         attempt += 1
         reconnectAt = now + backoffDelay(attempt)
         return []
@@ -302,10 +321,22 @@ public final class Endpoint {
     // MARK: - Helpers
 
     private func resendFrom(_ fromSeq: UInt64, _ effects: inout [Effect], _ now: Int) {
-        for e in outbox where e.seq >= fromSeq {
+        // outbox may be SPARSE after purge / snapshotDurable restore (host GC
+        // dropped some seqs mid-stream). Walk entries in seq order and inject a
+        // RESET before any seq that isn't contiguous with the last one we sent
+        // — it advances the peer's recvCursor over the gap so the following
+        // DATA frame delivers. Without this the peer holds the gap open,
+        // ACKs its old cursor, and we live-lock.
+        let entries = outbox.filter { $0.seq >= fromSeq }.sorted { $0.seq < $1.seq }
+        var expectedNext: UInt64 = fromSeq
+        for e in entries {
+            if e.seq > expectedNext {
+                effects.append(transmit(.reset(epoch: epoch, oldest: e.seq), now: now))
+            }
             let wireDurable = e.durable && peerDurableSupported
             effects.append(
                 transmit(.data(seq: e.seq, ack: recvCursor, payload: e.payload, durable: wireDurable), now: now))
+            expectedNext = e.seq + 1
         }
     }
 
@@ -363,10 +394,87 @@ public final class Endpoint {
     public var recvCursorValue: UInt64 { recvCursor }
     public var outboxSize: Int { outbox.count }
 
+    /// Cumulative bytes of payload currently in the outbox — for host memory
+    /// accounting / GC decisions. Does not include per-entry overhead.
+    /// See spec §11.
+    public var outboxByteSize: Int {
+        outbox.reduce(0) { $0 + $1.payload.count }
+    }
+    /// Count of durable-flagged entries in the outbox.
+    public var durableCount: Int {
+        outbox.reduce(0) { $0 + ($1.durable ? 1 : 0) }
+    }
+    /// Count of non-durable entries in the outbox.
+    public var nonDurableCount: Int {
+        outbox.reduce(0) { $0 + ($1.durable ? 0 : 1) }
+    }
+    /// The clock reading (host ms) when the OLDEST outbox entry was first sent.
+    /// Nil if the outbox is empty. Lets a host GC "entries older than N ms".
+    public var oldestSentAt: Int? {
+        outbox.map { $0.sentAt }.min()
+    }
+    /// Wall-clock ms of the most recent Connected → Disconnected transition,
+    /// or nil while Connected. Preserved across snapshot/restore. See §11.
+    public var disconnectedAtMs: Int? { disconnectedAt }
+
+    /// Remove outbox entries matching `predicate`. Returns dropped seqs and the
+    /// effects the removal produced (an `unstore` for any durable rows the
+    /// adapter should now delete from disk, plus an observational `purged`).
+    ///
+    /// This is the host's escape-hatch for GC. See spec §11.
+    public func purge(
+        _ predicate: (_ seq: UInt64, _ durable: Bool, _ sentAt: Int, _ byteLength: Int) -> Bool,
+        reason: String = "host"
+    ) -> (droppedSeqs: [UInt64], effects: [Effect]) {
+        var droppedSeqs: [UInt64] = []
+        var hadDurable = false
+        var maxDroppedDurableSeq: UInt64 = 0
+        var kept: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int)] = []
+        for e in outbox {
+            if predicate(e.seq, e.durable, e.sentAt, e.payload.count) {
+                droppedSeqs.append(e.seq)
+                if e.durable {
+                    hadDurable = true
+                    if e.seq > maxDroppedDurableSeq { maxDroppedDurableSeq = e.seq }
+                }
+            } else {
+                kept.append(e)
+            }
+        }
+        outbox = kept
+        var effects: [Effect] = []
+        if hadDurable { effects.append(.unstore(seqUpTo: maxDroppedDurableSeq)) }
+        if !droppedSeqs.isEmpty { effects.append(.purged(droppedSeqs: droppedSeqs, reason: reason)) }
+        return (droppedSeqs, effects)
+    }
+
+    /// Convenience: drop all non-durable outbox entries. See spec §11.
+    public func purgeNonDurable(reason: String = "gc") -> (droppedSeqs: [UInt64], effects: [Effect]) {
+        purge({ _, durable, _, _ in !durable }, reason: reason)
+    }
+
+    /// Snapshot the endpoint including ALL outbox entries (durable +
+    /// non-durable). Preserves pre-0.2.0 behavior. Use `snapshotDurable()`
+    /// for the spec-correct "durable-only" form when persisting across a
+    /// process restart.
     public func snapshot() -> Snapshot {
         Snapshot(
             epoch: epoch, sendSeq: sendSeq, outboxBase: outboxBase,
-            outbox: outbox, recvCursor: recvCursor, peerEpoch: peerEpoch)
+            outbox: outbox, recvCursor: recvCursor, peerEpoch: peerEpoch,
+            disconnectedAtMs: disconnectedAt)
+    }
+
+    /// Snapshot only durable outbox entries. Non-durable are by definition
+    /// "in-memory only, may be lost on restart" (spec §8.1). Persisting them
+    /// violates that contract AND causes unbounded memory growth if the host
+    /// writes snapshots aggressively. On restore the outbox may be sparse in
+    /// seq space; `resendFrom` handles gaps via RESET frames automatically.
+    public func snapshotDurable() -> Snapshot {
+        Snapshot(
+            epoch: epoch, sendSeq: sendSeq, outboxBase: outboxBase,
+            outbox: outbox.filter { $0.durable },
+            recvCursor: recvCursor, peerEpoch: peerEpoch,
+            disconnectedAtMs: disconnectedAt)
     }
 
     private func load(_ s: Snapshot) {
@@ -376,5 +484,6 @@ public final class Endpoint {
         outbox = s.outbox
         recvCursor = s.recvCursor
         peerEpoch = s.peerEpoch
+        disconnectedAt = s.disconnectedAtMs
     }
 }

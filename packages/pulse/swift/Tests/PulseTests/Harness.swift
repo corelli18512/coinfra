@@ -163,6 +163,9 @@ final class World {
             }
         case .close:
             if linkUp || blackholed { disconnect() }
+        case .purged:
+            // Observational — harness doesn't track; kraki host would log.
+            break
         }
     }
 

@@ -58,7 +58,16 @@ export type Effect =
    * Durable entries with seq ≤ `seqUpTo` are confirmed delivered (or expired)
    * and may be deleted from durable storage.
    */
-  | { t: 'unstore'; seqUpTo: Seq };
+  | { t: 'unstore'; seqUpTo: Seq }
+  /**
+   * Observational: the host purged outbox entries via {@link Endpoint.purge} or
+   * {@link Endpoint.purgeNonDurable}. `droppedSeqs` are the seqs that were
+   * removed. `reason` is echoed from the caller for logs/metrics. Peers will
+   * be told to skip these seqs on the next resend (as RESET frames), so
+   * delivery is not re-attempted. The application may want to log or surface
+   * that these sends will never confirm.
+   */
+  | { t: 'purged'; droppedSeqs: Seq[]; reason: string };
 
 /** Tunable parameters. Defaults in spec/PROTOCOL.md §8. */
 export interface PulseParams {
@@ -81,6 +90,11 @@ export const DEFAULT_PARAMS: PulseParams = {
  * A durable snapshot of an endpoint's producer+consumer state. An adapter that
  * wants restart-durability persists this and restores it via
  * {@link EndpointOptions.restore} before the first input. See spec §10.
+ *
+ * `disconnectedAtMs` (optional) records the wall-clock ms at which the endpoint
+ * last transitioned to Disconnected. Restored so a host GC policy that keys on
+ * "disconnected too long" survives restart. Absent for backward compat with
+ * pre-0.2.0 snapshots.
  */
 export interface Snapshot {
   epoch: string;
@@ -89,6 +103,7 @@ export interface Snapshot {
   outbox: Array<{ seq: string; payloadB64: string; durable?: boolean; sentAt?: number }>;
   recvCursor: string;
   peerEpoch: string;
+  disconnectedAtMs?: number | null;
 }
 
 /** Per-endpoint durability capability (advertised at handshake). See spec §8.1. */

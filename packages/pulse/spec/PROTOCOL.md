@@ -460,6 +460,8 @@ Every row is a scenario the test suites (`ts/src/__tests__`,
 | RESTART-DURABLE | producer restarts, reloads outbox+epoch | epoch preserved ⇒ resume succeeds across restart |
 | RESTART-FRESH | producer restarts with no state (new epoch) | consumer sees `peerEpoch` change in HELLO ⇒ resets `recvCursor = 0` and emits `ResetInbound(1, newEpoch)`; peer's fresh seq=1..N are delivered (not dropped as duplicates) |
 | TOO-OLD | consumer resumes past producer's pruned base | `RESET{oldest}` ⇒ `ResetInbound(oldest)`; gap surfaced, never hidden |
+| GC-NON-DURABLE | host purges non-durable outbox entries after a long disconnect (`purgeNonDurable`) | on next resend, RESET frames are emitted before each remaining seq that isn't contiguous with the previous — peer's `recvCursor` skips over the purged range; durable entries continue to deliver in order, exactly once |
+| SPARSE-RESUME | producer restores from `snapshotDurable()` (only durable outbox persisted) | sparse in-memory outbox after restore; `resendFrom` emits RESET-per-gap so the peer skips lost non-durable seqs, then delivers the surviving durables in order |
 | SLOW-LINK | high one-way propagation delay | delivery is delayed by the propagation time but stays in order, exactly once; outbox drains after the ack's round trip |
 | JITTER | per-frame delay varies, frames can cross | in-order, exactly-once delivery preserved; a hole waits for its predecessor |
 | DEAD-TIMER-RACE | RTT approaches `DEAD_AFTER_MS` | a healthy-but-slow link whose heartbeats still arrive is NOT false-killed; a link slower than the threshold IS declared dead (correct) |
@@ -488,4 +490,107 @@ Every row is a scenario the test suites (`ts/src/__tests__`,
   snapshot API.
 - It does not authenticate or pair. Establishing *which* peer is on the link is
   done before pulse sees any bytes.
+
+---
+
+## 11. Host-driven outbox lifecycle (GC)
+
+The core keeps every unacknowledged send in an in-memory outbox until the peer
+confirms via cursor. That is correct for a peer that reconnects within seconds.
+For a peer that is **permanently gone** — a revoked device, a closed browser
+tab, a churn artifact in a store-and-forward hub — the outbox grows without
+bound. The core cannot decide whether "silent for 10 minutes" means "on the
+subway" or "user threw the phone in the lake"; that judgment is the host's.
+Section §11 defines the API the core exposes to let a host make that judgment
+and act on it.
+
+### 11.1 Introspection
+
+Pure getters on `Endpoint`, all O(N) worst case in outbox size but N is
+small in practice:
+
+```
+outboxSize        # entry count
+outboxByteSize    # sum of payload byteLengths  (host memory accounting)
+durableCount      # entries with durable=true
+nonDurableCount   # entries with durable=false
+oldestSentAt      # host-clock ms of the oldest entry, or null if empty
+disconnectedAtMs  # host-clock ms of the most recent Connected→Disconnected,
+                  # or null while Connected. Preserved across snapshot/restore.
+```
+
+`disconnectedAtMs` is a `Connected → Disconnected` transition stamp: it is set
+when the endpoint first transitions to Disconnected and is NOT reset by
+repeated `onDisconnected` calls (adapter idempotency preservation). It clears
+to null on `onConnected`. This lets a host GC policy safely key on "the peer
+has been continuously offline for at least N ms".
+
+### 11.2 Purge
+
+```
+purge(predicate, reason='host') → {droppedSeqs, effects}
+purgeNonDurable(reason='gc')    → {droppedSeqs, effects}   # convenience
+```
+
+`purge` removes outbox entries for which `predicate({seq, durable, sentAt,
+byteLength})` returns true, and emits:
+
+- `Unstore(seqUpTo = max dropped durable seq)` — if any durable entry was
+  dropped, so the adapter deletes its disk copy. The adapter deletes only
+  durable rows it holds with `seq ≤ seqUpTo`, so surviving durables with
+  higher seqs are untouched.
+- `Purged(droppedSeqs, reason)` — observational, always emitted when
+  `droppedSeqs` is non-empty. `reason` is echoed from the caller for logs.
+
+Purge does NOT rewind `outboxBase` and does NOT synthesize new peer traffic.
+The peer only learns about the gap on the next resend, where `resendFrom`
+walks entries in seq order and emits a `RESET{oldest = e.seq}` frame before
+any entry that isn't contiguous with the previous one. The peer's `onReset`
+advances `recvCursor = oldest - 1`, skipping the purged range; the next DATA
+frame then delivers normally.
+
+This means the outbox is **allowed to be sparse** after a purge. `resendFrom`
+must sort entries by seq and inject a RESET per gap. This is a change from
+the original spec's implicit "outbox is a contiguous prefix"; the new rule
+is "outbox is a monotonically ordered set of seqs, possibly with holes".
+
+### 11.3 Snapshot separation
+
+`snapshot()` (unchanged, back-compat) serializes ALL outbox entries. It is
+kept as-is so pre-§11 adapters continue working.
+
+`snapshotDurable()` (new) serializes ONLY durable outbox entries. **This is
+the spec-correct form for restart-persistence.** Non-durable entries mean, by
+definition, "in-memory only, may be lost on restart" (§8.1); persisting them
+to disk violates that contract AND causes unbounded memory growth if the
+adapter writes snapshots on every hot-path frame (each save duplicates the
+same in-memory outbox into a growing on-disk representation).
+
+On restore from `snapshotDurable()`, the outbox is sparse in seq space
+(non-durable seqs are missing). `resendFrom`'s sparse-outbox handling (§11.2)
+takes care of the peer-side reconciliation via RESET frames.
+
+`sendSeq` is preserved by both snapshot forms so future sends never collide
+with the dropped seqs.
+
+### 11.4 GC policy is the host's
+
+The core provides no default GC. A store-and-forward hub might implement,
+per endpoint:
+
+```
+if endpoint.state == Disconnected
+   and now - endpoint.disconnectedAtMs > 5 * 60_000:
+    endpoint.purgeNonDurable(reason='gc-idle-5m')
+
+if endpoint.state == Disconnected
+   and now - endpoint.disconnectedAtMs > 24 * 3600_000:
+    # durable snapshot already on disk; safe to release the entire endpoint
+    deleteEndpoint(endpoint)
+```
+
+A per-tab web app might not GC at all (short-lived process, small outbox).
+A mobile client might set aggressive thresholds. The core does not care —
+its contract is just to make purge safe and to make the peer converge after
+one.
 ```

@@ -71,6 +71,11 @@ export class Endpoint {
   /** Last-known clock (ms), updated on every timed input. Used to stamp sentAt
    *  on send() which has no `now` of its own. */
   private clock = 0;
+  /** Wall-clock ms of the most recent transition to Disconnected, or null
+   *  while Connected (never disconnected in this run). Preserved across
+   *  snapshot/restore so a host GC policy that keys on "disconnected too long
+   *  → purge / evict" survives a process restart. See spec §11. */
+  private disconnectedAt: number | null = null;
 
   constructor(opts: EndpointOptions) {
     this.params = { ...DEFAULT_PARAMS, ...(opts.params ?? {}) };
@@ -111,6 +116,7 @@ export class Endpoint {
   onConnected(now: number): Effect[] {
     this.clock = now;
     this.state = LinkState.Connected;
+    this.disconnectedAt = null;
     this.attempt = 0;
     this.reconnectAt = null;
     this.lastRecvAt = now; // give the fresh link a full dead-window grace
@@ -134,6 +140,10 @@ export class Endpoint {
   onDisconnected(now: number): Effect[] {
     this.clock = now;
     this.state = LinkState.Disconnected;
+    // Stamp the disconnect time only on the first Connected → Disconnected
+    // transition — repeated calls (e.g. from adapter idempotency) must not
+    // reset the age a host GC policy is measuring against.
+    if (this.disconnectedAt === null) this.disconnectedAt = now;
     this.attempt += 1;
     this.reconnectAt = now + this.backoffDelay(this.attempt);
     return [];
@@ -312,24 +322,35 @@ export class Endpoint {
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   private resendFrom(fromSeq: Seq, effects: Effect[], now: number): void {
-    for (const e of this.outbox) {
-      if (e.seq >= fromSeq) {
-        // Preserve durable intent on resend: the wire bit reflects whether the
-        // peer can persist, matching the original send.
-        const wireDurable = e.durable && this.peerDurableSupported;
-        effects.push(
-          this.transmit(
-            {
-              t: 'data',
-              seq: e.seq,
-              ack: this.recvCursor,
-              payload: e.payload,
-              durable: wireDurable,
-            },
-            now,
-          ),
-        );
+    // outbox may be SPARSE after purge / snapshotDurable restore (host GC
+    // dropped some seqs mid-stream). Walk entries in seq order and inject a
+    // RESET before any seq that isn't contiguous with the last one we sent —
+    // it advances the peer's recvCursor over the gap so the following DATA
+    // frame delivers. Without this the peer holds the gap open, ACKs its old
+    // cursor, and we live-lock.
+    const entries = this.outbox
+      .filter((e) => e.seq >= fromSeq)
+      .sort((a, b) => (a.seq < b.seq ? -1 : a.seq > b.seq ? 1 : 0));
+    let expectedNext = fromSeq;
+    for (const e of entries) {
+      if (e.seq > expectedNext) {
+        // Missing seqs [expectedNext .. e.seq-1] — inform peer to skip them.
+        effects.push(this.transmit({ t: 'reset', epoch: this.epoch, oldest: e.seq }, now));
       }
+      const wireDurable = e.durable && this.peerDurableSupported;
+      effects.push(
+        this.transmit(
+          {
+            t: 'data',
+            seq: e.seq,
+            ack: this.recvCursor,
+            payload: e.payload,
+            durable: wireDurable,
+          },
+          now,
+        ),
+      );
+      expectedNext = e.seq + 1n;
     }
   }
 
@@ -386,13 +407,122 @@ export class Endpoint {
   get outboxSize(): number {
     return this.outbox.length;
   }
+  /** Cumulative bytes of payload currently in the outbox — for host memory
+   *  accounting / GC decisions. Does not include per-entry overhead (seq etc.).
+   *  See spec §11. */
+  get outboxByteSize(): number {
+    let n = 0;
+    for (const e of this.outbox) n += e.payload.byteLength;
+    return n;
+  }
+  /** Count of durable-flagged entries in the outbox. */
+  get durableCount(): number {
+    let n = 0;
+    for (const e of this.outbox) if (e.durable) n += 1;
+    return n;
+  }
+  /** Count of non-durable entries in the outbox. */
+  get nonDurableCount(): number {
+    let n = 0;
+    for (const e of this.outbox) if (!e.durable) n += 1;
+    return n;
+  }
+  /** The clock reading (host ms) when the OLDEST outbox entry was first sent.
+   *  Null if the outbox is empty. Lets a host GC "entries older than N ms". */
+  get oldestSentAt(): number | null {
+    let min: number | null = null;
+    for (const e of this.outbox) {
+      if (min === null || e.sentAt < min) min = e.sentAt;
+    }
+    return min;
+  }
+  /** Wall-clock ms of the most recent Connected → Disconnected transition,
+   *  or null while Connected. Preserved across snapshot/restore. Lets a host
+   *  policy key on "endpoint has been down for N minutes → purge outbox /
+   *  evict endpoint entirely". See spec §11. */
+  get disconnectedAtMs(): number | null {
+    return this.disconnectedAt;
+  }
 
+  /**
+   * Remove outbox entries matching `predicate`. Returns the seqs dropped and
+   * any effects the removal produced (an `unstore` for any durable rows the
+   * adapter should now delete from disk, plus an observational `purged`).
+   *
+   * This is the host's escape-hatch for GC: after a long disconnect it may
+   * decide that queued non-durable frames are stale ("nobody would want the
+   * animation frame from 10 minutes ago"), or that even durable entries have
+   * passed a domain-specific relevance window. The effects the peer sees on
+   * next resend are the same as if those seqs had been individually acked.
+   *
+   * See spec §11.
+   */
+  purge(predicate: (e: { seq: Seq; durable: boolean; sentAt: number; byteLength: number }) => boolean, reason = 'host'): { droppedSeqs: Seq[]; effects: Effect[] } {
+    const droppedSeqs: Seq[] = [];
+    let hadDurable = false;
+    let maxDroppedDurableSeq: Seq = 0n;
+    const kept: OutboxEntry[] = [];
+    for (const e of this.outbox) {
+      if (predicate({ seq: e.seq, durable: e.durable, sentAt: e.sentAt, byteLength: e.payload.byteLength })) {
+        droppedSeqs.push(e.seq);
+        if (e.durable) {
+          hadDurable = true;
+          if (e.seq > maxDroppedDurableSeq) maxDroppedDurableSeq = e.seq;
+        }
+      } else {
+        kept.push(e);
+      }
+    }
+    this.outbox = kept;
+    const effects: Effect[] = [];
+    // Tell the adapter to delete any durable rows the purge just dropped.
+    // We emit a coarse unstore(seqUpTo=maxDroppedDurableSeq); the adapter
+    // only deletes durable rows it holds ≤ that seq, so leftover durable
+    // entries > that seq are untouched.
+    if (hadDurable) effects.push({ t: 'unstore', seqUpTo: maxDroppedDurableSeq });
+    if (droppedSeqs.length > 0) effects.push({ t: 'purged', droppedSeqs, reason });
+    return { droppedSeqs, effects };
+  }
+
+  /** Convenience: drop all non-durable outbox entries. The common case for
+   *  the host GC (see spec §11 non-durable retention). */
+  purgeNonDurable(reason = 'gc'): { droppedSeqs: Seq[]; effects: Effect[] } {
+    return this.purge((e) => !e.durable, reason);
+  }
+
+  /**
+   * Snapshot the endpoint's state including ALL outbox entries (durable +
+   * non-durable). Preserves the pre-0.2.0 behavior; keeps existing hosts
+   * working unchanged. Use {@link snapshotDurable} for the spec-correct
+   * "durable-only" form when persisting across process restart.
+   */
   snapshot(): Snapshot {
+    return this.snapshotInternal((_e) => true);
+  }
+
+  /**
+   * Snapshot ONLY the durable outbox entries. This is the spec-correct form to
+   * persist across process restart: non-durable entries are, by definition,
+   * "in-memory only, may be lost on restart" (spec §8.1). Preserving them
+   * across restart both violates that contract AND causes unbounded memory
+   * growth if the host writes snapshots aggressively (each save duplicates
+   * the same in-memory outbox into a growing on-disk state).
+   *
+   * On restore from a durable-only snapshot, the outbox may be sparse in seq
+   * space. The core handles that transparently: `resendFrom` walks entries
+   * in seq order and emits a RESET frame before any gap, so the peer skips
+   * the lost non-durable seqs.
+   */
+  snapshotDurable(): Snapshot {
+    return this.snapshotInternal((e) => e.durable);
+  }
+
+  private snapshotInternal(filter: (e: OutboxEntry) => boolean): Snapshot {
     return {
       epoch: this.epoch,
       sendSeq: this.sendSeq.toString(),
       outboxBase: this.outboxBase.toString(),
-      outbox: this.outbox.map((e) => ({
+      outbox: this.outbox.filter(filter).map((e) => ({
         seq: e.seq.toString(),
         payloadB64: b64encode(e.payload),
         durable: e.durable,
@@ -400,6 +530,7 @@ export class Endpoint {
       })),
       recvCursor: this.recvCursor.toString(),
       peerEpoch: this.peerEpoch,
+      disconnectedAtMs: this.disconnectedAt,
     };
   }
 
@@ -415,5 +546,6 @@ export class Endpoint {
     }));
     this.recvCursor = BigInt(s.recvCursor);
     this.peerEpoch = s.peerEpoch;
+    this.disconnectedAt = s.disconnectedAtMs ?? null;
   }
 }
