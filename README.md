@@ -10,7 +10,7 @@ once, reuse it everywhere.
 
 | Package | What |
 |---|---|
-| [`@coinfra/auth`](packages/auth) | The sign-in wheel: Better Auth extended with domestic-China connectors (WeChat, WeCom, SMS OTP) and a house preset. Embedded library, no server. |
+| [`@coinfra/auth`](packages/auth) | The sign-in wheel: Better Auth extended with domestic-China connectors (WeChat, WeCom, Alipay, QQ, Weibo, Douyin, DingTalk, Feishu, SMS OTP) and a house preset. Embedded library, no server. |
 | [`@coinfra/crypto`](packages/crypto) | Hybrid public-key encryption (X25519 + AES-256-GCM) and Ed25519 signing, for many recipients. Cross-platform Web Crypto. |
 | [`@coinfra/pulse`](packages/pulse) | Reliable message delivery over a breakable WebSocket. |
 

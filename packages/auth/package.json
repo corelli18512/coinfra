@@ -16,6 +16,30 @@
       "types": "./dist/wecom.d.ts",
       "import": "./dist/wecom.js"
     },
+    "./alipay": {
+      "types": "./dist/alipay.d.ts",
+      "import": "./dist/alipay.js"
+    },
+    "./qq": {
+      "types": "./dist/qq.d.ts",
+      "import": "./dist/qq.js"
+    },
+    "./weibo": {
+      "types": "./dist/weibo.d.ts",
+      "import": "./dist/weibo.js"
+    },
+    "./douyin": {
+      "types": "./dist/douyin.d.ts",
+      "import": "./dist/douyin.js"
+    },
+    "./dingtalk": {
+      "types": "./dist/dingtalk.d.ts",
+      "import": "./dist/dingtalk.js"
+    },
+    "./feishu": {
+      "types": "./dist/feishu.d.ts",
+      "import": "./dist/feishu.js"
+    },
     "./sms": {
       "types": "./dist/sms.d.ts",
       "import": "./dist/sms.js"

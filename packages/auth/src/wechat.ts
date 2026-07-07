@@ -26,7 +26,8 @@ import { parseUserOutput } from 'better-auth/db';
 import { handleOAuthUserInfo } from 'better-auth/oauth2';
 import type { GenericOAuthConfig } from 'better-auth/plugins/generic-oauth';
 import * as z from 'zod';
-import { type FetchLike, getJson, queryString } from './internal/http.js';
+import { aesCbcDecrypt, fromBase64 } from './internal/crypto.js';
+import { type FetchLike, getJson, postJson, queryString } from './internal/http.js';
 import type { OAuth2Tokens, OAuth2UserInfo } from './internal/oauth.js';
 import type { BetterAuthPlugin } from './types.js';
 
@@ -344,4 +345,158 @@ export function wechatMiniProgram(options: WeChatMiniProgramOptions): BetterAuth
       ),
     },
   } as unknown as BetterAuthPlugin;
+}
+
+// --- WeChat Mini Program phone number ---------------------------------------
+
+const CGI_TOKEN_ENDPOINT = 'https://api.weixin.qq.com/cgi-bin/token';
+const GETUSERPHONENUMBER_ENDPOINT = 'https://api.weixin.qq.com/wxa/business/getuserphonenumber';
+
+/** A WeChat Mini Program encrypted payload, as produced by `wx.getPhoneNumber`
+ * (the classic `encryptedData` + `iv` route). */
+export interface WeChatEncryptedPayload {
+  /** Session key from {@link exchangeMiniProgramCode} — keep it server-side. */
+  sessionKey: string;
+  /** Base64 `encryptedData` from the mini program. */
+  encryptedData: string;
+  /** Base64 `iv` from the mini program. */
+  iv: string;
+}
+
+/** A decrypted WeChat phone number. */
+export interface WeChatPhoneNumber {
+  phoneNumber: string;
+  purePhoneNumber: string;
+  countryCode: string;
+  watermark?: { appid?: string; timestamp?: number };
+}
+
+/**
+ * Decrypt a WeChat Mini Program encrypted payload (AES-128-CBC, PKCS#7) with the
+ * `sessionKey` from {@link exchangeMiniProgramCode}, returning the parsed JSON.
+ * Works for any `wx.*` encrypted payload (phone number, `getUserInfo`, …).
+ * Throws if the sessionKey is wrong/expired or the plaintext is not JSON.
+ */
+export async function decryptWeChatData<T = Record<string, unknown>>(
+  payload: WeChatEncryptedPayload,
+): Promise<T> {
+  let plaintext: Uint8Array;
+  try {
+    plaintext = await aesCbcDecrypt(
+      fromBase64(payload.sessionKey),
+      fromBase64(payload.iv),
+      fromBase64(payload.encryptedData),
+    );
+  } catch {
+    throw new Error('WeChat data decryption failed (invalid or expired sessionKey)');
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(plaintext)) as T;
+  } catch {
+    throw new Error('WeChat data decryption produced invalid JSON');
+  }
+}
+
+/**
+ * Decrypt the `wx.getPhoneNumber` payload (the classic `encryptedData` route).
+ * When `appId` is given, the decrypted `watermark.appid` is verified against it —
+ * WeChat stamps every payload with the owning app id, so a mismatch means the
+ * data was not minted for your app and must be rejected.
+ */
+export async function getWeChatMiniProgramPhoneNumber(
+  payload: WeChatEncryptedPayload & { appId?: string },
+): Promise<WeChatPhoneNumber> {
+  const data = await decryptWeChatData<WeChatPhoneNumber>(payload);
+  if (payload.appId && data.watermark?.appid && data.watermark.appid !== payload.appId) {
+    throw new Error('WeChat phone number watermark appid mismatch');
+  }
+  if (!data.phoneNumber) {
+    throw new Error('WeChat phone number payload missing phoneNumber');
+  }
+  return data;
+}
+
+interface CgiTokenResponse {
+  access_token?: string;
+  expires_in?: number;
+  errcode?: number;
+  errmsg?: string;
+}
+
+/**
+ * Fetch a Mini Program **app** access token (`grant_type=client_credential`).
+ * This token is app-scoped and cacheable (~2h) by the caller; the phone-number
+ * helper fetches it fresh unless you pass one in.
+ */
+export async function getMiniProgramAccessToken(params: {
+  appId: string;
+  appSecret: string;
+  fetch?: FetchLike;
+}): Promise<string> {
+  const fetchImpl = params.fetch ?? globalThis.fetch;
+  const url = `${CGI_TOKEN_ENDPOINT}?${queryString({
+    grant_type: 'client_credential',
+    appid: params.appId,
+    secret: params.appSecret,
+  })}`;
+  const data = await getJson<CgiTokenResponse>(url, fetchImpl);
+  if (data.errcode || !data.access_token) {
+    throw new Error(
+      `WeChat cgi-bin/token failed (${data.errcode ?? 'no token'}): ${data.errmsg ?? ''}`.trim(),
+    );
+  }
+  return data.access_token;
+}
+
+interface GetPhoneNumberResponse {
+  errcode?: number;
+  errmsg?: string;
+  phone_info?: {
+    phoneNumber?: string;
+    purePhoneNumber?: string;
+    countryCode?: string;
+    watermark?: { appid?: string; timestamp?: number };
+  };
+}
+
+/**
+ * Resolve a WeChat phone number via the **modern** code route
+ * (`wx.getPhoneNumber` with a `code`, no client-side decryption). Exchanges the
+ * `code` at `getuserphonenumber` using an app access token, which is fetched for
+ * you from `appId`/`appSecret` unless you supply a cached `accessToken`.
+ */
+export async function getWeChatMiniProgramPhoneNumberByCode(params: {
+  appId?: string;
+  appSecret?: string;
+  accessToken?: string;
+  code: string;
+  fetch?: FetchLike;
+}): Promise<WeChatPhoneNumber> {
+  const fetchImpl = params.fetch ?? globalThis.fetch;
+  let token = params.accessToken;
+  if (!token) {
+    if (!params.appId || !params.appSecret) {
+      throw new Error('getWeChatMiniProgramPhoneNumberByCode needs accessToken or appId+appSecret');
+    }
+    token = await getMiniProgramAccessToken({
+      appId: params.appId,
+      appSecret: params.appSecret,
+      fetch: fetchImpl,
+    });
+  }
+
+  const url = `${GETUSERPHONENUMBER_ENDPOINT}?${queryString({ access_token: token })}`;
+  const data = await postJson<GetPhoneNumberResponse>(url, { code: params.code }, fetchImpl);
+  if (data.errcode || !data.phone_info?.phoneNumber) {
+    throw new Error(
+      `WeChat getuserphonenumber failed (${data.errcode ?? 'no phone'}): ${data.errmsg ?? ''}`.trim(),
+    );
+  }
+  const info = data.phone_info;
+  return {
+    phoneNumber: info.phoneNumber as string,
+    purePhoneNumber: info.purePhoneNumber ?? '',
+    countryCode: info.countryCode ?? '',
+    watermark: info.watermark,
+  };
 }

@@ -9,6 +9,7 @@
  * to get it right again.
  */
 import { phoneNumber } from 'better-auth/plugins/phone-number';
+import { hmacSha256, sha256Hex, toHex } from './internal/crypto.js';
 import type { FetchLike } from './internal/http.js';
 import type { BetterAuthPlugin } from './types.js';
 
@@ -202,6 +203,208 @@ export function aliyunSms(config: AliyunSmsConfig): SmsProvider {
       if (data.Code !== 'OK') {
         throw new Error(
           `Aliyun SMS send failed (${data.Code ?? 'unknown'}): ${data.Message ?? ''}`.trim(),
+        );
+      }
+    },
+  };
+}
+
+// --- Tencent Cloud (腾讯云) SMS ----------------------------------------------
+
+/** Configuration for {@link tencentSms}. */
+export interface TencentSmsConfig {
+  /** API SecretId. */
+  secretId: string;
+  /** API SecretKey. */
+  secretKey: string;
+  /** SMS application id (短信应用 SdkAppId). */
+  smsSdkAppId: string;
+  /** Approved signature content (短信签名内容). */
+  signName: string;
+  /** Approved template id (模板 ID). */
+  templateId: string;
+  /** API region. @default "ap-guangzhou" */
+  region?: string;
+  /** Service endpoint. @default "https://sms.tencentcloudapi.com" */
+  endpoint?: string;
+  /** Injected `fetch`, for tests. @default globalThis.fetch */
+  fetch?: FetchLike;
+  /** Clock, for deterministic tests. @default Date.now */
+  now?: () => number;
+}
+
+interface TencentSmsResponse {
+  Response?: {
+    SendStatusSet?: Array<{ Code?: string; Message?: string; PhoneNumber?: string }>;
+    Error?: { Code?: string; Message?: string };
+    RequestId?: string;
+  };
+}
+
+const TENCENT_SMS_SERVICE = 'sms';
+const TENCENT_SMS_ACTION = 'SendSms';
+const TENCENT_SMS_VERSION = '2021-01-11';
+
+/**
+ * Compute the Tencent Cloud **TC3-HMAC-SHA256** `Authorization` header for an
+ * SMS request body. This is the AWS-SigV4-style scheme (derived signing key:
+ * key → date → service → `tc3_request`). Exported for testing; most callers only
+ * need {@link tencentSms}.
+ */
+export async function signTencentRequest(params: {
+  secretId: string;
+  secretKey: string;
+  host: string;
+  payload: string;
+  timestamp: number;
+}): Promise<string> {
+  const date = new Date(params.timestamp * 1000).toISOString().slice(0, 10);
+  const action = TENCENT_SMS_ACTION.toLowerCase();
+
+  const canonicalHeaders = `content-type:application/json; charset=utf-8\nhost:${params.host}\nx-tc-action:${action}\n`;
+  const signedHeaders = 'content-type;host;x-tc-action';
+  const hashedPayload = await sha256Hex(params.payload);
+  const canonicalRequest = `POST\n/\n\n${canonicalHeaders}\n${signedHeaders}\n${hashedPayload}`;
+
+  const credentialScope = `${date}/${TENCENT_SMS_SERVICE}/tc3_request`;
+  const stringToSign = `TC3-HMAC-SHA256\n${params.timestamp}\n${credentialScope}\n${await sha256Hex(canonicalRequest)}`;
+
+  const secretDate = await hmacSha256(`TC3${params.secretKey}`, date);
+  const secretService = await hmacSha256(secretDate, TENCENT_SMS_SERVICE);
+  const secretSigning = await hmacSha256(secretService, 'tc3_request');
+  const signature = toHex(await hmacSha256(secretSigning, stringToSign));
+
+  return `TC3-HMAC-SHA256 Credential=${params.secretId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+}
+
+/**
+ * Tencent Cloud SMS provider. Signs and sends a `SendSms` request with TC3.
+ * Phone numbers must be E.164 (e.g. `+8613800138000`). As with {@link aliyunSms},
+ * the unit tests cover request shape and signing determinism, not Tencent's
+ * server behaviour — verify credentials against the live service.
+ */
+export function tencentSms(config: TencentSmsConfig): SmsProvider {
+  const endpoint = config.endpoint ?? 'https://sms.tencentcloudapi.com';
+  const host = new URL(endpoint).host;
+  const region = config.region ?? 'ap-guangzhou';
+  const fetchImpl = config.fetch ?? globalThis.fetch;
+  const now = config.now ?? Date.now;
+
+  return {
+    send: async ({ phoneNumber: to, code }) => {
+      const timestamp = Math.floor(now() / 1000);
+      const payload = JSON.stringify({
+        PhoneNumberSet: [to],
+        SmsSdkAppId: config.smsSdkAppId,
+        SignName: config.signName,
+        TemplateId: config.templateId,
+        TemplateParamSet: [code],
+      });
+
+      const authorization = await signTencentRequest({
+        secretId: config.secretId,
+        secretKey: config.secretKey,
+        host,
+        payload,
+        timestamp,
+      });
+
+      const response = await fetchImpl(endpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: authorization,
+          'Content-Type': 'application/json; charset=utf-8',
+          Host: host,
+          'X-TC-Action': TENCENT_SMS_ACTION,
+          'X-TC-Timestamp': String(timestamp),
+          'X-TC-Version': TENCENT_SMS_VERSION,
+          'X-TC-Region': region,
+        },
+        body: payload,
+      });
+      if (!response.ok) {
+        throw new Error(`Tencent SMS request failed with HTTP ${response.status}`);
+      }
+      const data = (await response.json()) as TencentSmsResponse;
+      if (data.Response?.Error) {
+        throw new Error(
+          `Tencent SMS send failed (${data.Response.Error.Code ?? 'unknown'}): ${data.Response.Error.Message ?? ''}`.trim(),
+        );
+      }
+      const status = data.Response?.SendStatusSet?.[0];
+      if (status?.Code !== 'Ok') {
+        throw new Error(
+          `Tencent SMS send failed (${status?.Code ?? 'unknown'}): ${status?.Message ?? ''}`.trim(),
+        );
+      }
+    },
+  };
+}
+
+// --- Twilio (出海) SMS -------------------------------------------------------
+
+/** Configuration for {@link twilioSms}. */
+export interface TwilioSmsConfig {
+  /** Account SID. */
+  accountSid: string;
+  /** Auth token. */
+  authToken: string;
+  /** Sender phone number (E.164). Provide this or {@link messagingServiceSid}. */
+  from?: string;
+  /** Messaging Service SID, an alternative sender to {@link from}. */
+  messagingServiceSid?: string;
+  /**
+   * Render the message body from the code.
+   * @default (code) => `Your verification code is ${code}.`
+   */
+  template?: (code: string) => string;
+  /** Service endpoint. @default "https://api.twilio.com" */
+  endpoint?: string;
+  /** Injected `fetch`, for tests. @default globalThis.fetch */
+  fetch?: FetchLike;
+}
+
+interface TwilioResponse {
+  sid?: string;
+  status?: string;
+  code?: number;
+  message?: string;
+}
+
+/**
+ * Twilio SMS provider — the default for overseas (出海) apps. Sends via the
+ * Messages resource with HTTP basic auth. Provide either {@link TwilioSmsConfig.from}
+ * or {@link TwilioSmsConfig.messagingServiceSid}.
+ */
+export function twilioSms(config: TwilioSmsConfig): SmsProvider {
+  if (!config.from && !config.messagingServiceSid) {
+    throw new Error('twilioSms requires either `from` or `messagingServiceSid`');
+  }
+  const endpoint = config.endpoint ?? 'https://api.twilio.com';
+  const fetchImpl = config.fetch ?? globalThis.fetch;
+  const template = config.template ?? ((code: string) => `Your verification code is ${code}.`);
+
+  return {
+    send: async ({ phoneNumber: to, code }) => {
+      const body = new URLSearchParams({ To: to, Body: template(code) });
+      if (config.messagingServiceSid) body.set('MessagingServiceSid', config.messagingServiceSid);
+      if (config.from) body.set('From', config.from);
+
+      const response = await fetchImpl(
+        `${endpoint}/2010-04-01/Accounts/${config.accountSid}/Messages.json`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Basic ${btoa(`${config.accountSid}:${config.authToken}`)}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: body.toString(),
+        },
+      );
+      const data = (await response.json().catch(() => ({}))) as TwilioResponse;
+      if (!response.ok || data.code) {
+        throw new Error(
+          `Twilio SMS send failed (${data.code ?? response.status}): ${data.message ?? ''}`.trim(),
         );
       }
     },

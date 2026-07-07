@@ -1,9 +1,9 @@
 # @coinfra/auth
 
 **The sign-in wheel. [Better Auth](https://better-auth.com) as the engine, extended — not
-wrapped — with the domestic-China connectors it lacks (WeChat, WeCom, SMS OTP) and a
-coinfra house preset. An embedded library: each app runs it in-process, no standalone
-identity server.**
+wrapped — with the domestic-China connectors it lacks (WeChat, WeCom, Alipay, QQ, Weibo,
+Douyin, DingTalk, Feishu, and SMS OTP) and a coinfra house preset. An embedded library:
+each app runs it in-process, no standalone identity server.**
 
 `createCoinfraAuth()` returns the **real** Better Auth instance — its `.api`, its
 `authClient`, its plugins are all native. coinfra adds the pieces Better Auth doesn't ship
@@ -52,9 +52,15 @@ auth.api.getSession(/* … */);
 | Subpath | Exports | Returns |
 |---|---|---|
 | `@coinfra/auth` | `createCoinfraAuth`, types | the real Better Auth instance |
-| `@coinfra/auth/wechat` | `wechat()`, `wechatMiniProgram()` | a `genericOAuth` config / a plugin |
+| `@coinfra/auth/wechat` | `wechat()`, `wechatMiniProgram()`, `getWeChatMiniProgramPhoneNumber()` | a `genericOAuth` config / a plugin / helpers |
 | `@coinfra/auth/wecom` | `wecom()` | a `genericOAuth` config |
-| `@coinfra/auth/sms` | `smsOTP()`, `aliyunSms()` | a plugin / an `SmsProvider` |
+| `@coinfra/auth/alipay` | `alipay()` | a `genericOAuth` config |
+| `@coinfra/auth/qq` | `qq()` | a `genericOAuth` config |
+| `@coinfra/auth/weibo` | `weibo()` | a `genericOAuth` config |
+| `@coinfra/auth/douyin` | `douyin()` | a `genericOAuth` config |
+| `@coinfra/auth/dingtalk` | `dingtalk()` | a `genericOAuth` config |
+| `@coinfra/auth/feishu` | `feishu()` | a `genericOAuth` config |
+| `@coinfra/auth/sms` | `smsOTP()`, `aliyunSms()`, `tencentSms()`, `twilioSms()` | a plugin / `SmsProvider`s |
 | `@coinfra/auth/client` | `wechatMiniProgramClient()`, `smsOTPClient` | client plugins |
 
 Every helper returns a **native Better Auth shape**, so you can also drop them straight into
@@ -89,6 +95,18 @@ createCoinfraAuth({ /* … */, plugins: [wechatMiniProgram({ appId, appSecret })
 // exposes  auth.api.signInWeChatMiniProgram({ body: { code } })
 ```
 
+To read the user's phone number, use either route:
+
+```ts
+import {
+  getWeChatMiniProgramPhoneNumber,       // classic: decrypt encryptedData + iv (AES-128-CBC)
+  getWeChatMiniProgramPhoneNumberByCode, // modern: exchange the getPhoneNumber code, no crypto
+} from '@coinfra/auth/wechat';
+
+await getWeChatMiniProgramPhoneNumber({ sessionKey, encryptedData, iv, appId }); // verifies watermark
+await getWeChatMiniProgramPhoneNumberByCode({ appId, appSecret, code });
+```
+
 ### WeCom (企业微信)
 
 ```ts
@@ -100,6 +118,30 @@ wecom({ corpId, corpSecret, agentId });
 Handles the two-step `gettoken` → `getuserinfo` dance and, when the app has directory
 permission, enriches the profile via `user/get` (best-effort, falls back to the userid).
 
+### More OAuth connectors (支付宝 / QQ / 微博 / 抖音 / 钉钉 / 飞书)
+
+Each returns a `genericOAuth` config — drop it into `oauthProviders` exactly like `wechat()`.
+Every quirk (Alipay's RSA2 request signing, QQ's `openid` lookup, Douyin's `client_key`,
+DingTalk's header-token profile call, Feishu's v2 JSON token) is folded into the connector.
+
+```ts
+import { alipay } from '@coinfra/auth/alipay';
+import { qq } from '@coinfra/auth/qq';
+import { weibo } from '@coinfra/auth/weibo';
+import { douyin } from '@coinfra/auth/douyin';
+import { dingtalk } from '@coinfra/auth/dingtalk';
+import { feishu } from '@coinfra/auth/feishu';
+
+oauthProviders: [
+  alipay({ appId, appPrivateKey }),        // RSA2-signed; appPrivateKey is a PKCS#8 PEM
+  qq({ appId, appKey }),                    // prefers unionid when enabled
+  weibo({ appKey, appSecret }),
+  douyin({ clientKey, clientSecret }),
+  dingtalk({ clientId, clientSecret }),
+  feishu({ appId, appSecret }),             // domain: 'lark' for international Lark
+];
+```
+
 ### SMS OTP (国内短信)
 
 `smsOTP()` is Better Auth's `phoneNumber` plugin with the "send this code" step delegated to
@@ -109,13 +151,17 @@ signs the user up on the spot (synthetic `<digits>@phone.local` email; override 
 `signUpOnVerification` / `tempEmailDomain`).
 
 ```ts
-import { smsOTP, aliyunSms, createRecordingSmsProvider } from '@coinfra/auth/sms';
+import { smsOTP, aliyunSms, tencentSms, twilioSms, createRecordingSmsProvider } from '@coinfra/auth/sms';
 
 smsOTP({ provider: aliyunSms({ accessKeyId, accessKeySecret, signName, templateCode }) });
+smsOTP({ provider: tencentSms({ secretId, secretKey, smsSdkAppId, signName, templateId }) });
+smsOTP({ provider: twilioSms({ accountSid, authToken, from }) }); // 出海 default
 smsOTP({ provider: createRecordingSmsProvider().provider }); // dev/tests: records, never sends
 ```
 
-Implement the one-method `SmsProvider` interface to add Tencent Cloud, Twilio, or any gateway.
+`aliyunSms` (阿里云) and `tencentSms` (腾讯云, TC3-HMAC-SHA256) cover the domestic gateways;
+`twilioSms` is the overseas default. Implement the one-method `SmsProvider` interface to add
+any other gateway.
 
 ### Client
 
@@ -133,10 +179,12 @@ await authClient.phoneNumber.sendOtp({ phoneNumber }); // Better Auth's phone cl
 
 ## A note on testing & credentials
 
-The connectors are unit-tested through an injected `fetch` that scripts the exact
-WeChat / WeCom / Aliyun responses. Those tests verify coinfra's wiring, parsing, and request
-signing — **not** the providers' live behaviour, which needs real credentials. Verify the
-authorize redirects and signatures against the live services in your own environment.
+The connectors are unit-tested through an injected `fetch` that scripts the exact provider
+responses, and the signing/crypto (Aliyun RPC, Tencent TC3, Alipay RSA2, WeChat AES) is
+covered by determinism and round-trip tests. Those tests verify coinfra's wiring, parsing,
+and request signing — **not** the providers' live behaviour, which needs real credentials.
+Verify the authorize redirects and signatures against the live services in your own
+environment.
 
 ## License
 

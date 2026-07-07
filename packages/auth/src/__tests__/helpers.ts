@@ -40,17 +40,45 @@ export interface MockRoute {
   status?: number;
 }
 
+/** A recorded outbound request, so tests can assert POST bodies and headers. */
+export interface RecordedRequest {
+  url: string;
+  method: string;
+  body?: string;
+  headers: Record<string, string>;
+}
+
 /**
  * A {@link FetchLike} that answers by matching request URLs against `routes`
- * (first substring match wins) and records every requested URL. This is the
- * injection point that lets connector tests script exact WeChat/WeCom responses
- * with no network and no real credentials.
+ * (first substring match wins) and records every request. `calls` keeps the
+ * requested URLs (the original, URL-driven connectors assert on these); the
+ * richer `requests` array also captures method/body/headers for the connectors
+ * that carry the auth `code` in a POST body (DingTalk, Feishu, Weibo, …). This
+ * is the injection point that lets connector tests script exact provider
+ * responses with no network and no real credentials.
  */
-export function mockFetch(routes: MockRoute[]): { fetch: FetchLike; calls: string[] } {
+export function mockFetch(routes: MockRoute[]): {
+  fetch: FetchLike;
+  calls: string[];
+  requests: RecordedRequest[];
+} {
   const calls: string[] = [];
-  const fetch = (async (input: unknown) => {
+  const requests: RecordedRequest[] = [];
+  const fetch = (async (input: unknown, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : String((input as { url: string }).url);
     calls.push(url);
+    const headers: Record<string, string> = {};
+    if (init?.headers) {
+      for (const [key, value] of Object.entries(init.headers as Record<string, string>)) {
+        headers[key.toLowerCase()] = value;
+      }
+    }
+    requests.push({
+      url,
+      method: init?.method ?? 'GET',
+      body: typeof init?.body === 'string' ? init.body : undefined,
+      headers,
+    });
     const route = routes.find((candidate) => url.includes(candidate.match));
     if (!route) return new Response('no matching mock route', { status: 404 });
     return new Response(JSON.stringify(route.json ?? {}), {
@@ -58,5 +86,5 @@ export function mockFetch(routes: MockRoute[]): { fetch: FetchLike; calls: strin
       headers: { 'content-type': 'application/json' },
     });
   }) as unknown as FetchLike;
-  return { fetch, calls };
+  return { fetch, calls, requests };
 }
