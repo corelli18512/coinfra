@@ -12,7 +12,6 @@
 import { describe, expect, it } from 'vitest';
 import { Endpoint } from '../endpoint.js';
 import { DEFAULT_PARAMS, type Effect } from '../types.js';
-import { decodeFrame } from '../wire.js';
 import { marker, payloadsOf, World } from './harness.js';
 
 const A_EPOCH = 'A';
@@ -130,10 +129,10 @@ describe('GC-2: disconnectedAtMs tracks Connected → Disconnected transitions',
 describe('GC-3: purgeNonDurable drops non-durable entries and emits observability', () => {
   it('removes only non-durable entries', () => {
     const a = new Endpoint({ epoch: A_EPOCH, random: () => 0.5, durable: { supported: true } });
-    a.send(marker(1));                        // seq 1 non-durable
-    a.send(marker(2), { durable: true });     // seq 2 durable
-    a.send(marker(3));                        // seq 3 non-durable
-    a.send(marker(4), { durable: true });     // seq 4 durable
+    a.send(marker(1)); // seq 1 non-durable
+    a.send(marker(2), { durable: true }); // seq 2 durable
+    a.send(marker(3)); // seq 3 non-durable
+    a.send(marker(4), { durable: true }); // seq 4 durable
 
     const { droppedSeqs, effects } = a.purgeNonDurable();
     expect(droppedSeqs.map(String).sort()).toEqual(['1', '3']);
@@ -232,11 +231,11 @@ describe('GC-5: after purge, resend announces the gap so the peer skips it', () 
     w.connect();
     w.disconnect();
 
-    w.sendA(marker(1));                       // seq 1 non-durable
-    w.sendA(marker(2), { durable: true });    // seq 2 durable
-    w.sendA(marker(3));                       // seq 3 non-durable
-    w.sendA(marker(4), { durable: true });    // seq 4 durable
-    w.sendA(marker(5));                       // seq 5 non-durable
+    w.sendA(marker(1)); // seq 1 non-durable
+    w.sendA(marker(2), { durable: true }); // seq 2 durable
+    w.sendA(marker(3)); // seq 3 non-durable
+    w.sendA(marker(4), { durable: true }); // seq 4 durable
+    w.sendA(marker(5)); // seq 5 non-durable
 
     // Simulate the host GC that motivated this feature.
     w.a.purgeNonDurable();
@@ -296,10 +295,10 @@ describe('GC-5: after purge, resend announces the gap so the peer skips it', () 
 describe('GC-6: snapshotDurable persists only durable outbox entries', () => {
   it('serializes only durable entries; non-durable are dropped', () => {
     const a = new Endpoint({ epoch: A_EPOCH, random: () => 0.5, durable: { supported: true } });
-    a.send(marker(1));                        // non-durable
-    a.send(marker(2), { durable: true });     // durable
-    a.send(marker(3));                        // non-durable
-    a.send(marker(4), { durable: true });     // durable
+    a.send(marker(1)); // non-durable
+    a.send(marker(2), { durable: true }); // durable
+    a.send(marker(3)); // non-durable
+    a.send(marker(4), { durable: true }); // durable
 
     const s = a.snapshotDurable();
     expect(s.outbox.map((e) => e.seq).sort()).toEqual(['2', '4']);
@@ -324,10 +323,10 @@ describe('GC-6: snapshotDurable persists only durable outbox entries', () => {
     );
     w1.connect();
     w1.disconnect();
-    w1.sendA(marker(1));                       // non-durable — will be lost
-    w1.sendA(marker(2), { durable: true });    // durable — must survive
-    w1.sendA(marker(3));                       // non-durable — will be lost
-    w1.sendA(marker(4), { durable: true });    // durable — must survive
+    w1.sendA(marker(1)); // non-durable — will be lost
+    w1.sendA(marker(2), { durable: true }); // durable — must survive
+    w1.sendA(marker(3)); // non-durable — will be lost
+    w1.sendA(marker(4), { durable: true }); // durable — must survive
 
     const snap = w1.a.snapshotDurable();
 
@@ -350,8 +349,16 @@ describe('GC-7: hub-style host GC keeps outbox memory bounded', () => {
     // in the same user). A stays connected; B goes offline permanently. The
     // hub forwards every A → * broadcast into BOTH peer endpoints. Without
     // GC, B's endpoint accumulates unbounded non-durable frames.
-    const activePeer = new Endpoint({ epoch: 'active', random: () => 0.5, durable: { supported: true } });
-    const stalePeer = new Endpoint({ epoch: 'stale', random: () => 0.5, durable: { supported: true } });
+    const activePeer = new Endpoint({
+      epoch: 'active',
+      random: () => 0.5,
+      durable: { supported: true },
+    });
+    const stalePeer = new Endpoint({
+      epoch: 'stale',
+      random: () => 0.5,
+      durable: { supported: true },
+    });
     activePeer.onConnected(0);
     stalePeer.onConnected(0);
     stalePeer.onDisconnected(1_000); // never comes back

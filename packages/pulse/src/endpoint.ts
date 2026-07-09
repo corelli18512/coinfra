@@ -503,13 +503,23 @@ export class Endpoint {
    *
    * See spec §11.
    */
-  purge(predicate: (e: { seq: Seq; durable: boolean; sentAt: number; byteLength: number }) => boolean, reason = 'host'): { droppedSeqs: Seq[]; effects: Effect[] } {
+  purge(
+    predicate: (e: { seq: Seq; durable: boolean; sentAt: number; byteLength: number }) => boolean,
+    reason = 'host',
+  ): { droppedSeqs: Seq[]; effects: Effect[] } {
     const droppedSeqs: Seq[] = [];
     let hadDurable = false;
     let maxDroppedDurableSeq: Seq = 0n;
     const kept: OutboxEntry[] = [];
     for (const e of this.outbox) {
-      if (predicate({ seq: e.seq, durable: e.durable, sentAt: e.sentAt, byteLength: e.payload.byteLength })) {
+      if (
+        predicate({
+          seq: e.seq,
+          durable: e.durable,
+          sentAt: e.sentAt,
+          byteLength: e.payload.byteLength,
+        })
+      ) {
         droppedSeqs.push(e.seq);
         if (e.durable) {
           hadDurable = true;

@@ -136,7 +136,7 @@ describe('DURABLE-2: the DATA durable bit is gated on peer support', () => {
     let peerHello: Uint8Array | null = null;
     for (const e of peer.onConnected(0)) if (e.t === 'transmit') peerHello = e.bytes;
     a.onConnected(0);
-    a.onBytes(peerHello!, 0);
+    if (peerHello) a.onBytes(peerHello, 0);
     const { effects } = a.send(marker(1), { durable: true });
     for (const e of effects) {
       if (e.t === 'transmit') {
@@ -163,7 +163,7 @@ describe('DURABLE-3: a durable-supported endpoint stores its durable sends', () 
     const disk = new Map<bigint, number>();
     // Not connected yet.
     const { effects } = a.send(marker(7), { durable: true });
-    for (const e of effects) if (e.t === 'store') disk.set(e.seq, e.payload[0]!);
+    for (const e of effects) if (e.t === 'store') disk.set(e.seq, e.payload[0] ?? 0);
     expect(disk.get(1n)).toBe(7);
   });
 
@@ -211,7 +211,7 @@ describe('DURABLE-5: only durable messages hit the store', () => {
     const a = new Endpoint({ epoch: 'A', random: () => 0.5, durable: { supported: true } });
     const disk = new Map<bigint, number>();
     const apply = (effects: Effect[]) => {
-      for (const e of effects) if (e.t === 'store') disk.set(e.seq, e.payload[0]!);
+      for (const e of effects) if (e.t === 'store') disk.set(e.seq, e.payload[0] ?? 0);
     };
     apply(a.send(marker(1)).effects); // plain  → seq 1
     apply(a.send(marker(2), { durable: true }).effects); // durable → seq 2

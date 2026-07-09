@@ -43,7 +43,7 @@ describe('COALESCE-BASIC: an offline producer collapses same-key sends to one', 
     expect(seqsOf(w.deliveredB)).toEqual([100n]); // fresh seq, dropped seqs skipped
     // The coalesce hint rides the wire and surfaces on the deliver effect so a
     // bridging hub can re-apply it on the next hop.
-    expect(w.deliveredB[0]!.coalesceKey).toBe('k1');
+    expect(w.deliveredB[0]?.coalesceKey).toBe('k1');
     // Peer was told to skip the 1..99 gap (reset-inbound at the coalesced seq).
     expect(w.resetsB.at(-1)).toEqual({ fromSeq: 100n, peerEpoch: A_EPOCH });
   });
@@ -107,7 +107,7 @@ describe('COALESCE-SNAPSHOT: coalesceKey survives snapshot round-trip', () => {
 
     const snap = w.a.snapshot();
     expect(snap.outbox.length).toBe(1);
-    expect(snap.outbox[0]!.coalesceKey).toBe('k1');
+    expect(snap.outbox[0]?.coalesceKey).toBe('k1');
 
     // Full restart of A from the snapshot.
     const restored = new Endpoint({ epoch: A_EPOCH, random: () => 0.5, restore: snap });

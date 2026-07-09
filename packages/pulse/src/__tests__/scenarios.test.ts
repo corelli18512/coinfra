@@ -270,10 +270,7 @@ describe('RESTART-FRESH: producer restarts with no state (new epoch)', () => {
     const A2_EPOCH = 'A-reborn';
 
     // Phase 1: A sends 3 messages, B receives + acks.
-    const w1 = new World(
-      { epoch: A1_EPOCH, random },
-      { epoch: B_EPOCH, random },
-    );
+    const w1 = new World({ epoch: A1_EPOCH, random }, { epoch: B_EPOCH, random });
     w1.connect();
     for (let i = 1; i <= 3; i++) w1.sendA(marker(i));
     w1.advance(DEFAULT_PARAMS.heartbeatIntervalMs + 1);
@@ -285,8 +282,8 @@ describe('RESTART-FRESH: producer restarts with no state (new epoch)', () => {
     const bSnapshot = w1.b.snapshot();
     w1.disconnect();
     const w2 = new World(
-      { epoch: A2_EPOCH, random },                              // A: fresh, NO restore
-      { epoch: B_EPOCH, random, restore: bSnapshot },           // B: retains state
+      { epoch: A2_EPOCH, random }, // A: fresh, NO restore
+      { epoch: B_EPOCH, random, restore: bSnapshot }, // B: retains state
     );
     w2.connect();
 
@@ -304,7 +301,6 @@ describe('RESTART-FRESH: producer restarts with no state (new epoch)', () => {
     expect(w2.resetsB[0]!.peerEpoch).toBe(A2_EPOCH);
   });
 });
-
 
 describe('WEDGE-FREE: repeated churn always converges to drained + connected', () => {
   it('survives interleaved disconnects, sends, and blackholes', () => {
