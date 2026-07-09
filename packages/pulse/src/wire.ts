@@ -34,7 +34,7 @@ export type Frame =
        *  durableSupported; 0 otherwise. */
       maxRetentionMs: Seq;
     }
-  | { t: 'data'; seq: Seq; ack: Seq; payload: Uint8Array; durable: boolean }
+  | { t: 'data'; seq: Seq; ack: Seq; payload: Uint8Array; durable: boolean; coalesceKey?: string }
   | { t: 'ack'; ack: Seq }
   | { t: 'reset'; epoch: string; oldest: Seq }
   | { t: 'heartbeat'; ack: Seq };
@@ -91,10 +91,14 @@ export function encodeFrame(f: Frame): Uint8Array {
       break;
     case 'data':
       w.header(FrameType.DATA);
-      w.u8(f.durable ? 1 : 0);
+      // flags: bit0 = durable (existing), bit1 = has coalesceKey (spec §12).
+      w.u8((f.durable ? 1 : 0) | (f.coalesceKey !== undefined ? 2 : 0));
       w.u64(f.seq);
       w.u64(f.ack);
       w.blob(f.payload);
+      // Optional trailing coalesceKey str (1-byte len + ≤255 UTF-8 bytes). Old
+      // decoders read the blob and return, ignoring these trailing bytes.
+      if (f.coalesceKey !== undefined) w.str(f.coalesceKey);
       break;
     case 'ack':
       w.header(FrameType.ACK);
@@ -194,7 +198,13 @@ export function decodeFrame(bytes: Uint8Array): Frame | null {
         const seq = r.u64();
         const ack = r.u64();
         const payload = r.blob();
-        return { t: 'data', seq, ack, payload, durable: (msgFlags & 1) === 1 };
+        const durable = (msgFlags & 1) === 1;
+        // bit1 ⇒ a trailing coalesceKey str follows the payload (spec §12).
+        if ((msgFlags & 2) === 2) {
+          const coalesceKey = r.str();
+          return { t: 'data', seq, ack, payload, durable, coalesceKey };
+        }
+        return { t: 'data', seq, ack, payload, durable };
       }
       case FrameType.ACK:
         return { t: 'ack', ack: r.u64() };
