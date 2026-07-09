@@ -249,7 +249,7 @@ export class World {
   // ── Internal plumbing ──────────────────────────────────────────────────────
 
   /** Carry out a batch of effects from the endpoint identified by outbound dir. */
-  private pump(effects: Effect[], dir: Dir): void {
+  pump(effects: Effect[], dir: Dir): void {
     for (const e of effects) this.applyEffect(e, dir);
   }
 
