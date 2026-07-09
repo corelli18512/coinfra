@@ -26,8 +26,11 @@ export type Effect =
   /** Hand this payload to the application — in order, exactly once. */
   /** Hand this payload to the application — in order, exactly once. `durable`
    *  echoes the sender's per-message durable flag, so a bridging application can
-   *  preserve the intent when forwarding onto another hop. Pure transport info. */
-  | { t: 'deliver'; seq: Seq; payload: Payload; durable: boolean }
+   *  preserve the intent when forwarding onto another hop. `coalesceKey` echoes
+   *  the sender's send-time coalesce hint (spec §12) when present, so a bridging
+   *  application (e.g. a store-and-forward hub) can re-apply the same key when
+   *  forwarding onto another hop. Both are pure transport info. */
+  | { t: 'deliver'; seq: Seq; payload: Payload; durable: boolean; coalesceKey?: string }
   /** Begin establishing the link (dial). */
   | { t: 'open' }
   /** Tear down the current link (dead/stale). */
@@ -100,7 +103,14 @@ export interface Snapshot {
   epoch: string;
   sendSeq: string; // bigint as decimal string (JSON-safe)
   outboxBase: string;
-  outbox: Array<{ seq: string; payloadB64: string; durable?: boolean; sentAt?: number }>;
+  outbox: Array<{
+    seq: string;
+    payloadB64: string;
+    durable?: boolean;
+    sentAt?: number;
+    /** Send-time coalesce key (spec §12). Absent on pre-0.3.0 snapshots. */
+    coalesceKey?: string;
+  }>;
   recvCursor: string;
   peerEpoch: string;
   disconnectedAtMs?: number | null;

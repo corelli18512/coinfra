@@ -35,8 +35,8 @@ export class World {
   readonly b: Endpoint;
 
   /** Payloads delivered to the application at each side, in delivery order. */
-  readonly deliveredA: Array<{ seq: bigint; payload: Uint8Array }> = [];
-  readonly deliveredB: Array<{ seq: bigint; payload: Uint8Array }> = [];
+  readonly deliveredA: Array<{ seq: bigint; payload: Uint8Array; coalesceKey?: string }> = [];
+  readonly deliveredB: Array<{ seq: bigint; payload: Uint8Array; coalesceKey?: string }> = [];
   /** reset-inbound effects observed at each side. */
   readonly resetsA: Array<{ fromSeq: bigint; peerEpoch: string }> = [];
   readonly resetsB: Array<{ fromSeq: bigint; peerEpoch: string }> = [];
@@ -44,6 +44,9 @@ export class World {
    *  for messages that side SENT). Last value = latest. */
   readonly ackedA: bigint[] = [];
   readonly ackedB: bigint[] = [];
+  /** `purged` effects (send-time coalescing / host GC) observed at each side. */
+  readonly purgedA: Array<{ droppedSeqs: bigint[]; reason: string }> = [];
+  readonly purgedB: Array<{ droppedSeqs: bigint[]; reason: string }> = [];
   /** Durable store effects observed at each side: entries the adapter would
    *  persist. Keyed by seq → payload byte marker. unstore removes ≤ seqUpTo. */
   readonly storeA = new Map<bigint, number>();
@@ -190,12 +193,12 @@ export class World {
 
   // ── Application send ───────────────────────────────────────────────────────
 
-  sendA(payload: Uint8Array, opts?: { durable?: boolean }): bigint {
+  sendA(payload: Uint8Array, opts?: { durable?: boolean; coalesceKey?: string }): bigint {
     const { seq, effects } = this.a.send(payload, opts);
     this.pump(effects, 'AtoB');
     return seq;
   }
-  sendB(payload: Uint8Array, opts?: { durable?: boolean }): bigint {
+  sendB(payload: Uint8Array, opts?: { durable?: boolean; coalesceKey?: string }): bigint {
     const { seq, effects } = this.b.send(payload, opts);
     this.pump(effects, 'BtoA');
     return seq;
@@ -263,6 +266,7 @@ export class World {
         (producedByA ? this.deliveredA : this.deliveredB).push({
           seq: e.seq,
           payload: e.payload,
+          coalesceKey: e.coalesceKey,
         });
         break;
       case 'reset-inbound':
@@ -288,6 +292,12 @@ export class World {
         }
         break;
       }
+      case 'purged':
+        (producedByA ? this.purgedA : this.purgedB).push({
+          droppedSeqs: e.droppedSeqs,
+          reason: e.reason,
+        });
+        break;
       case 'open':
         // Endpoint asked to dial. The two endpoints share one link, so a dial
         // from either side brings it up for both — but only once (idempotent):

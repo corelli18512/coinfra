@@ -26,6 +26,10 @@ interface OutboxEntry {
   durable: boolean;
   /** When first assigned a send time, for retention expiry (ms). */
   sentAt: number;
+  /** Send-time coalesce key (spec §12). Entries sharing a key supersede each
+   *  other: a later send with the same key drops earlier ones from the outbox.
+   *  Mutually exclusive with `durable` (enforced in send()). */
+  coalesceKey?: string;
 }
 
 // Isomorphic base64 for snapshot payloads (runs in Node AND the browser). The
@@ -87,7 +91,42 @@ export class Endpoint {
 
   // ── Inputs ──────────────────────────────────────────────────────────────
 
-  send(payload: Payload, opts?: { durable?: boolean }): { seq: Seq; effects: Effect[] } {
+  send(
+    payload: Payload,
+    opts?: { durable?: boolean; coalesceKey?: string },
+  ): { seq: Seq; effects: Effect[] } {
+    // coalesceKey implies durable=false: "never lose" and "may be dropped" are a
+    // semantic contradiction. Fail loud rather than silently pick one (spec §12).
+    if (opts?.coalesceKey !== undefined && opts?.durable === true) {
+      throw new Error('coalesceKey requires durable=false');
+    }
+    // Validate key length before any state mutation (encodeFrame will later
+    // throw RangeError for keys >255 UTF-8 bytes, but by then the outbox is
+    // already mutated and the caller has no seq — the entry is orphaned).
+    if (opts?.coalesceKey !== undefined && new TextEncoder().encode(opts.coalesceKey).length > 255) {
+      throw new Error('coalesceKey exceeds 255 bytes');
+    }
+    const effects: Effect[] = [];
+    // Send-time coalescing (spec §12): drop every existing outbox entry with the
+    // same key BEFORE appending the new one. Dropped seqs become gaps the peer
+    // skips over via the existing RESET-on-resend path (same as purge*). The new
+    // message always gets a fresh seq — dropped seqs are never re-used.
+    if (opts?.coalesceKey !== undefined) {
+      const key = opts.coalesceKey;
+      const droppedSeqs: Seq[] = [];
+      this.outbox = this.outbox.filter((e) => {
+        if (e.coalesceKey === key) {
+          droppedSeqs.push(e.seq);
+          return false;
+        }
+        return true;
+      });
+      // No unstore: coalesceable entries are never durable (guarded above), so
+      // nothing was ever persisted. Emit `purged` for logs/metrics only.
+      if (droppedSeqs.length > 0) {
+        effects.push({ t: 'purged', droppedSeqs, reason: `coalesced:${key}` });
+      }
+    }
     this.sendSeq += 1n;
     const seq = this.sendSeq;
     // A message is durable only if the app asked AND we can persist. If the app
@@ -95,8 +134,7 @@ export class Endpoint {
     const durable = opts?.durable === true && this.durable.supported;
     // Outbox entry created BEFORE any transmit (spec §3 ordering rule): the
     // payload is resendable before it is ever entrusted to the wire.
-    this.outbox.push({ seq, payload, durable, sentAt: this.clock });
-    const effects: Effect[] = [];
+    this.outbox.push({ seq, payload, durable, sentAt: this.clock, coalesceKey: opts?.coalesceKey });
     // Persist to durable storage immediately (before transmit), so it survives a
     // restart even if the socket is down right now. Only seq+bytes — no target.
     if (durable) effects.push({ t: 'store', seq, payload });
@@ -107,7 +145,14 @@ export class Endpoint {
       // one that will hold the message onward — e.g. a store-and-forward node.)
       const wireDurable = opts?.durable === true && this.peerDurableSupported;
       effects.push(
-        this.transmit({ t: 'data', seq, ack: this.recvCursor, payload, durable: wireDurable }),
+        this.transmit({
+          t: 'data',
+          seq,
+          ack: this.recvCursor,
+          payload,
+          durable: wireDurable,
+          coalesceKey: opts?.coalesceKey,
+        }),
       );
     }
     return { seq, effects };
@@ -258,7 +303,13 @@ export class Endpoint {
     this.pruneOutbox(f.ack, effects); // peer piggybacks its receipt of our outbound
     if (f.seq === this.recvCursor + 1n) {
       this.recvCursor = f.seq;
-      effects.push({ t: 'deliver', seq: f.seq, payload: f.payload, durable: f.durable });
+      effects.push({
+        t: 'deliver',
+        seq: f.seq,
+        payload: f.payload,
+        durable: f.durable,
+        coalesceKey: f.coalesceKey,
+      });
     } else if (f.seq <= this.recvCursor) {
       // Duplicate (a resend because our earlier ack was lost). Re-advertise our
       // cursor so the sender learns we already have it and stops resending —
@@ -346,6 +397,7 @@ export class Endpoint {
             ack: this.recvCursor,
             payload: e.payload,
             durable: wireDurable,
+            coalesceKey: e.coalesceKey,
           },
           now,
         ),
@@ -527,6 +579,7 @@ export class Endpoint {
         payloadB64: b64encode(e.payload),
         durable: e.durable,
         sentAt: e.sentAt,
+        coalesceKey: e.coalesceKey,
       })),
       recvCursor: this.recvCursor.toString(),
       peerEpoch: this.peerEpoch,
@@ -543,6 +596,7 @@ export class Endpoint {
       payload: b64decode(e.payloadB64),
       durable: e.durable ?? false,
       sentAt: e.sentAt ?? 0,
+      coalesceKey: e.coalesceKey,
     }));
     this.recvCursor = BigInt(s.recvCursor);
     this.peerEpoch = s.peerEpoch;

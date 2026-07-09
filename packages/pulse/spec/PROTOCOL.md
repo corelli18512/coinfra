@@ -163,7 +163,7 @@ Primitives:
 | type | name | body |
 |------|------|------|
 | 1 | HELLO | `str epoch` · `str recvEpoch` · `u64 recvCursor` · `u8 durFlags` · `u64 maxRetentionMs` |
-| 2 | DATA | `u8 msgFlags` · `u64 seq` · `u64 ack` · `blob payload` |
+| 2 | DATA | `u8 msgFlags` · `u64 seq` · `u64 ack` · `blob payload` · `[str coalesceKey]` |
 | 3 | ACK | `u64 ack` |
 | 4 | RESET | `str epoch` · `u64 oldest` |
 | 5 | HEARTBEAT | `u64 ack` |
@@ -177,6 +177,12 @@ Primitives:
 - DATA `msgFlags` bit 0 = `durable` (this message must be persisted, not merely
   buffered in memory — see §8.x). The sender only sets it when the peer
   advertised `durableSupported`; otherwise it is ignored on the wire.
+- DATA `msgFlags` bit 1 = `hasCoalesceKey` (§12). When set, a trailing `str`
+  (the coalesce key, ≤255 UTF-8 bytes) follows the payload blob. When clear, no
+  trailing field is present and the frame is byte-identical to the pre-§12
+  layout. An old decoder that does not know bit 1 reads the payload blob and
+  stops, silently ignoring the trailing key — harmless, because coalescing is a
+  producer-side operation that has already happened on the sender's outbox.
 
 A frame that is malformed, has the wrong magic/version, or an unknown type is
 **ignored** (dropped without state change). Robustness over strictness: a future
@@ -594,3 +600,60 @@ A mobile client might set aggressive thresholds. The core does not care —
 its contract is just to make purge safe and to make the peer converge after
 one.
 ```
+
+## 12. Send-time coalescing (`coalesceKey`)
+
+Pulse's default contract is a **reliable queue**: every send is retained and
+replayed until acked. That is correct for events that must not be lost
+(`user_message`, `agent_message`, `tool_result`). It is *wrong* for
+**state-covering** streams — UI deltas, a session's current card state — where
+only the latest value matters and replaying N stale frames on reconnect is pure
+waste (and, at scale, a UI-freezing burst).
+
+`coalesceKey` lets the application declare "these messages supersede each other"
+without Pulse ever inspecting the payload:
+
+```
+send(payload, { coalesceKey: k }):
+    assert not durable            # mutually exclusive (see below)
+    droppedSeqs = [e.seq for e in outbox if e.coalesceKey == k]
+    outbox = [e for e in outbox if e.coalesceKey != k]   # drop supersededs
+    if droppedSeqs: emit Purged(droppedSeqs, reason='coalesced:'+k)
+    sendSeq += 1
+    outbox.append((sendSeq, payload, coalesceKey=k))
+    if link == Connected:
+        emit Transmit(encodeDATA(seq=sendSeq, ack=recvCursor, payload, coalesceKey=k))
+    return sendSeq
+```
+
+**Rules**
+
+1. **Drop-and-replace.** A send with key `k` drops every existing outbox entry
+   with key `k` before appending. The new message always gets a fresh
+   `sendSeq`; dropped seqs are never re-used.
+2. **Dropped seqs become gaps.** The consumer sees a sparse seq stream. The
+   existing resume/resend path announces each gap with a `RESET { oldest }`
+   frame (identical to what `purge*` produces, §11.2), so the peer advances its
+   `recvCursor` over the gap and the following DATA delivers. **No new consumer
+   logic is required.**
+3. **Mutually exclusive with `durable`.** `durable` = "never lose"; `coalesce` =
+   "may be dropped". Requesting both is a contradiction and MUST throw. Because
+   coalesceable entries are therefore never durable, coalescing emits no
+   `Unstore` — nothing was ever persisted.
+4. **In-flight coalescing is allowed.** An entry already transmitted but not yet
+   acked can still be coalesced away. The peer may have already delivered the
+   old payload to its application; the newer same-key message simply overwrites
+   that state. Downstream applications MUST therefore treat a coalesced payload
+   as a **state snapshot**, not an incremental delta.
+5. **The hint rides the wire and the `deliver` effect.** DATA carries the key
+   (flag bit 1 + trailing `str`, §5.0), and `deliver` echoes
+   `coalesceKey?: string`. A store-and-forward hub can thus re-apply the same
+   key when forwarding onto the next hop, so coalescing composes across a
+   multi-hop path (e.g. tentacle → head → arm: the key set at the origin is
+   preserved to the endpoint whose outbox actually accumulates).
+
+**Wire / snapshot / compatibility.** DATA gains flag bit 1 and an optional
+trailing `coalesceKey` str (≤255 UTF-8 bytes; §5.0). `OutboxEntry` in the
+snapshot (§10) gains `coalesceKey?: string`. Both are additive: pre-§12 peers
+and snapshots interoperate unchanged — an old decoder ignores the trailing key,
+and a new frame without a key is byte-identical to the old layout.

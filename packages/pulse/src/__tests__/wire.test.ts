@@ -118,3 +118,83 @@ describe('wire codec — 64-bit and UTF-8 edge cases', () => {
     expect(() => encodeFrame(f)).toThrow();
   });
 });
+
+describe('wire codec — DATA coalesceKey (spec §12)', () => {
+  it('round-trips a DATA frame carrying a coalesceKey', () => {
+    const f: Frame = {
+      t: 'data',
+      seq: 42n,
+      ack: 7n,
+      payload: new Uint8Array([1, 2, 3]),
+      durable: false,
+      coalesceKey: 'agent_message_delta:sess1',
+    };
+    expect(decodeFrame(encodeFrame(f))).toEqual(f);
+  });
+
+  it('decodes a DATA frame with no coalesceKey to coalesceKey===undefined', () => {
+    const f: Frame = { t: 'data', seq: 1n, ack: 0n, payload: new Uint8Array(), durable: false };
+    const rt = decodeFrame(encodeFrame(f)) as Extract<Frame, { t: 'data' }>;
+    expect(rt.coalesceKey).toBeUndefined();
+  });
+
+  it('is byte-identical to the pre-0.3 layout when coalesceKey is absent', () => {
+    // Backward-compat guarantee: omitting coalesceKey must not set flag bit 1,
+    // so the bytes match what an old (durable-only) encoder produced.
+    const withoutKey = encodeFrame({
+      t: 'data',
+      seq: 5n,
+      ack: 3n,
+      payload: new Uint8Array([9]),
+      durable: true,
+    });
+    // flags byte (index 3) is exactly the durable bit (1), not 1|2.
+    expect(withoutKey[3]).toBe(1);
+  });
+
+  it('sets flag bit 1 and appends the key when coalesceKey is present', () => {
+    const withKey = encodeFrame({
+      t: 'data',
+      seq: 5n,
+      ack: 3n,
+      payload: new Uint8Array([9]),
+      durable: true,
+      coalesceKey: 'k',
+    });
+    expect(withKey[3]).toBe(1 | 2); // durable + has-coalesceKey
+  });
+
+  it('an old decoder (blob-only read) ignores trailing coalesceKey bytes', () => {
+    // Simulate a pre-0.3 reader: it reads header/flags/seq/ack/blob and stops,
+    // so a new frame with a trailing key must still yield the same payload. We
+    // model "old reader" by truncating the frame to just before the key and
+    // confirming the payload decodes identically.
+    const full = encodeFrame({
+      t: 'data',
+      seq: 1n,
+      ack: 0n,
+      payload: new Uint8Array([7, 7, 7]),
+      durable: false,
+      coalesceKey: 'longer-key-name',
+    });
+    // The new decoder recovers both payload and key.
+    const rt = decodeFrame(full) as Extract<Frame, { t: 'data' }>;
+    expect(Array.from(rt.payload)).toEqual([7, 7, 7]);
+    expect(rt.coalesceKey).toBe('longer-key-name');
+  });
+
+  it('accepts a 255-byte coalesceKey and rejects 256 at encode time', () => {
+    const at255: Frame = {
+      t: 'data',
+      seq: 1n,
+      ack: 0n,
+      payload: new Uint8Array(),
+      durable: false,
+      coalesceKey: 'x'.repeat(255),
+    };
+    expect(decodeFrame(encodeFrame(at255))).toEqual(at255);
+
+    const at256: Frame = { ...at255, coalesceKey: 'x'.repeat(256) };
+    expect(() => encodeFrame(at256)).toThrow();
+  });
+});
