@@ -7,8 +7,13 @@ import {
   encrypt,
   encryptToBlob,
   generateEncryptionKeyPair,
+  generateEncryptionKeyPairHandle,
   generateSigningKeyPair,
+  generateSigningKeyPairHandle,
+  importEncryptionPrivateKey,
+  importSigningPrivateKey,
   type KeyPair,
+  type KeyPairHandle,
   serializeEnvelope,
   signChallenge,
   verifyChallenge,
@@ -88,8 +93,11 @@ describe('encrypt / decrypt', () => {
       { recipientId: 'alice', publicKey: alice.publicKey },
       { recipientId: 'bob', publicKey: bob.publicKey },
     ]);
-    const a = envelope.recipients.alice!;
-    const b = envelope.recipients.bob!;
+    const a = envelope.recipients.alice;
+    const b = envelope.recipients.bob;
+    if (!a || !b) {
+      throw new Error('expected both recipients');
+    }
     expect(a.epk).not.toBe(b.epk);
     expect(a.key).not.toBe(b.key);
   });
@@ -156,7 +164,10 @@ describe('decrypt failures', () => {
     const envelope = await encrypt('secret', [
       { recipientId: 'alice', publicKey: alice.publicKey },
     ]);
-    const entry = envelope.recipients.alice!;
+    const entry = envelope.recipients.alice;
+    if (!entry) {
+      throw new Error('expected alice recipient');
+    }
     const tampered = {
       ...envelope,
       recipients: { alice: { ...entry, key: flipBase64urlByte(entry.key) } },
@@ -169,9 +180,13 @@ describe('decrypt failures', () => {
       { recipientId: 'alice', publicKey: alice.publicKey },
     ]);
     // Move alice's entry under a different id; the wrap AAD no longer matches.
+    const aliceEntry = envelope.recipients.alice;
+    if (!aliceEntry) {
+      throw new Error('expected alice recipient');
+    }
     const relabeled = {
       ...envelope,
-      recipients: { mallory: envelope.recipients.alice! },
+      recipients: { mallory: aliceEntry },
     };
     await expect(decrypt(relabeled, 'mallory', alice.privateKey)).rejects.toThrow();
   });
@@ -281,6 +296,60 @@ describe('challenge-response signing (Ed25519)', () => {
   });
 });
 
+describe('non-extractable key handles', () => {
+  it('generates an X25519 handle whose private key cannot be exported', async () => {
+    const handle: KeyPairHandle = await generateEncryptionKeyPairHandle();
+    expect(typeof handle.publicKey).toBe('string');
+    expect(handle.publicKey).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(handle.privateKey.extractable).toBe(false);
+    await expect(globalThis.crypto.subtle.exportKey('pkcs8', handle.privateKey)).rejects.toThrow();
+  });
+
+  it('generates an Ed25519 handle whose private key cannot be exported', async () => {
+    const handle = await generateSigningKeyPairHandle();
+    expect(handle.privateKey.extractable).toBe(false);
+    await expect(globalThis.crypto.subtle.exportKey('pkcs8', handle.privateKey)).rejects.toThrow();
+  });
+
+  it('round-trips encryption with a CryptoKey private handle', async () => {
+    const handle = await generateEncryptionKeyPairHandle();
+    const envelope = await encrypt('handle message', [
+      { recipientId: 'h', publicKey: handle.publicKey },
+    ]);
+    expect(await decrypt(envelope, 'h', handle.privateKey)).toBe('handle message');
+  });
+
+  it('decrypts a blob with a CryptoKey private handle', async () => {
+    const handle = await generateEncryptionKeyPairHandle();
+    const blob = await encryptToBlob('blob via handle', [
+      { recipientId: 'h', publicKey: handle.publicKey },
+    ]);
+    expect(await decryptFromBlob(blob, 'h', handle.privateKey)).toBe('blob via handle');
+  });
+
+  it('imports a string private key once and reuses it across messages', async () => {
+    const key = await importEncryptionPrivateKey(alice.privateKey);
+    const first = await encrypt('one', [{ recipientId: 'alice', publicKey: alice.publicKey }]);
+    const second = await encrypt('two', [{ recipientId: 'alice', publicKey: alice.publicKey }]);
+    expect(await decrypt(first, 'alice', key)).toBe('one');
+    expect(await decrypt(second, 'alice', key)).toBe('two');
+  });
+
+  it('signs with a CryptoKey handle and verifies against its public key', async () => {
+    const handle = await generateSigningKeyPairHandle();
+    const sig = await signChallenge('nonce-42', handle.privateKey);
+    expect(await verifyChallenge('nonce-42', sig, handle.publicKey)).toBe(true);
+  });
+
+  it('signing with an imported key equals signing with the string key (Ed25519 is deterministic)', async () => {
+    const imported = await importSigningPrivateKey(signer.privateKey);
+    const fromString = await signChallenge('same-nonce', signer.privateKey);
+    const fromHandle = await signChallenge('same-nonce', imported);
+    expect(fromHandle).toBe(fromString);
+    expect(await verifyChallenge('same-nonce', fromHandle, signer.publicKey)).toBe(true);
+  });
+});
+
 describe('canonicalJson', () => {
   it('sorts top-level keys', () => {
     expect(canonicalJson({ b: 1, a: 2, c: 3 })).toBe('{"a":2,"b":1,"c":3}');
@@ -316,7 +385,7 @@ function flipBase64urlByte(b64url: string): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
   const chars = b64url.split('');
   const i = Math.floor(chars.length / 2);
-  const current = alphabet.indexOf(chars[i]!);
-  chars[i] = alphabet[(current + 1) % alphabet.length]!;
+  const current = alphabet.indexOf(chars[i] ?? '');
+  chars[i] = alphabet[(current + 1) % alphabet.length] ?? '';
   return chars.join('');
 }

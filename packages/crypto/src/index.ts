@@ -18,13 +18,34 @@
 
 // ── Runtime handle ──────────────────────────────────────
 
-const subtle: SubtleCrypto = globalThis.crypto.subtle;
+let cachedSubtle: SubtleCrypto | undefined;
+
+/**
+ * Lazily resolve the Web Crypto `SubtleCrypto` implementation.
+ *
+ * Reading it at module load throws in runtimes where `globalThis.crypto` is
+ * absent; deferring lets the module still be imported and fail only when a
+ * primitive is actually used — with a clear, actionable message.
+ */
+function subtle(): SubtleCrypto {
+  if (cachedSubtle) {
+    return cachedSubtle;
+  }
+  const impl = globalThis.crypto?.subtle;
+  if (!impl) {
+    throw new Error(
+      '@coinfra/crypto requires the Web Crypto API (globalThis.crypto.subtle), which is unavailable in this runtime.',
+    );
+  }
+  cachedSubtle = impl;
+  return cachedSubtle;
+}
 
 /** A `Uint8Array` explicitly backed by a (non-shared) `ArrayBuffer`. */
 type Bytes = Uint8Array<ArrayBuffer>;
 
 /** Structural stand-in for the `CryptoKeyPair` global (not present under node-only lib types). */
-interface KeyPairHandle {
+interface NativeKeyPair {
   publicKey: CryptoKey;
   privateKey: CryptoKey;
 }
@@ -37,6 +58,21 @@ export interface KeyPair {
   publicKey: string;
   /** base64url of the PKCS#8 private key. */
   privateKey: string;
+}
+
+/**
+ * A key pair whose private key stays a non-extractable {@link CryptoKey}.
+ *
+ * Unlike {@link KeyPair}, the private key material never becomes a string in JS
+ * memory, so it can't be read by injected script (XSS) or serialized by
+ * accident. Prefer this for long-lived identity keys, and persist it via
+ * IndexedDB (a `CryptoKey` is structured-cloneable) rather than as text.
+ */
+export interface KeyPairHandle {
+  /** base64url of the raw public key (32 bytes) — safe to share as text. */
+  publicKey: string;
+  /** Non-extractable private key; calling `exportKey` on it rejects. */
+  privateKey: CryptoKey;
 }
 
 /** A recipient the message should be encrypted for. */
@@ -97,6 +133,7 @@ const B64URL_LOOKUP: number[] = (() => {
   return table;
 })();
 
+// biome-ignore-start lint/style/noNonNullAssertion: base64url codec indices are provably in-bounds — the encode loops are length-guarded and the decode lookup table is fully populated for every code point < 128.
 function toBase64url(bytes: Uint8Array): string {
   let out = '';
   let i = 0;
@@ -169,6 +206,7 @@ function fromBase64url(text: string): Bytes {
   }
   return out;
 }
+// biome-ignore-end lint/style/noNonNullAssertion: end of base64url codec.
 
 // ── byte helpers ────────────────────────────────────────
 
@@ -199,9 +237,9 @@ function randomBytes(size: number): Bytes {
 
 // ── Key generation & import ─────────────────────────────
 
-async function exportKeyPair(kp: KeyPairHandle): Promise<KeyPair> {
-  const rawPub = new Uint8Array(await subtle.exportKey('raw', kp.publicKey));
-  const pkcs8 = new Uint8Array(await subtle.exportKey('pkcs8', kp.privateKey));
+async function exportKeyPair(kp: NativeKeyPair): Promise<KeyPair> {
+  const rawPub = new Uint8Array(await subtle().exportKey('raw', kp.publicKey));
+  const pkcs8 = new Uint8Array(await subtle().exportKey('pkcs8', kp.privateKey));
   return { publicKey: toBase64url(rawPub), privateKey: toBase64url(pkcs8) };
 }
 
@@ -209,9 +247,9 @@ async function exportKeyPair(kp: KeyPairHandle): Promise<KeyPair> {
  * Generate an X25519 key pair for {@link encrypt}/{@link decrypt}.
  */
 export async function generateEncryptionKeyPair(): Promise<KeyPair> {
-  const kp = (await subtle.generateKey({ name: 'X25519' }, true, [
+  const kp = (await subtle().generateKey({ name: 'X25519' }, true, [
     'deriveBits',
-  ])) as unknown as KeyPairHandle;
+  ])) as unknown as NativeKeyPair;
   return exportKeyPair(kp);
 }
 
@@ -219,21 +257,81 @@ export async function generateEncryptionKeyPair(): Promise<KeyPair> {
  * Generate an Ed25519 key pair for {@link signChallenge}/{@link verifyChallenge}.
  */
 export async function generateSigningKeyPair(): Promise<KeyPair> {
-  const kp = (await subtle.generateKey({ name: 'Ed25519' }, true, [
+  const kp = (await subtle().generateKey({ name: 'Ed25519' }, true, [
     'sign',
     'verify',
-  ])) as unknown as KeyPairHandle;
+  ])) as unknown as NativeKeyPair;
   return exportKeyPair(kp);
 }
 
 function importX25519Public(publicKey: string): Promise<CryptoKey> {
-  return subtle.importKey('raw', fromBase64url(publicKey), { name: 'X25519' }, true, []);
+  return subtle().importKey('raw', fromBase64url(publicKey), { name: 'X25519' }, true, []);
 }
 
 function importX25519Private(privateKey: string): Promise<CryptoKey> {
-  return subtle.importKey('pkcs8', fromBase64url(privateKey), { name: 'X25519' }, false, [
+  return subtle().importKey('pkcs8', fromBase64url(privateKey), { name: 'X25519' }, false, [
     'deriveBits',
   ]);
+}
+
+function importEd25519Private(privateKey: string): Promise<CryptoKey> {
+  return subtle().importKey('pkcs8', fromBase64url(privateKey), { name: 'Ed25519' }, false, [
+    'sign',
+  ]);
+}
+
+async function exportRawPublic(kp: NativeKeyPair): Promise<string> {
+  return toBase64url(new Uint8Array(await subtle().exportKey('raw', kp.publicKey)));
+}
+
+function resolveX25519Private(key: string | CryptoKey): Promise<CryptoKey> {
+  return typeof key === 'string' ? importX25519Private(key) : Promise.resolve(key);
+}
+
+function resolveEd25519Private(key: string | CryptoKey): Promise<CryptoKey> {
+  return typeof key === 'string' ? importEd25519Private(key) : Promise.resolve(key);
+}
+
+/**
+ * Generate an X25519 key pair whose private key is a non-extractable
+ * {@link CryptoKey} (never materialized as a string), for
+ * {@link encrypt}/{@link decrypt}. Prefer this over
+ * {@link generateEncryptionKeyPair} for long-lived identity keys.
+ */
+export async function generateEncryptionKeyPairHandle(): Promise<KeyPairHandle> {
+  const kp = (await subtle().generateKey({ name: 'X25519' }, false, [
+    'deriveBits',
+  ])) as unknown as NativeKeyPair;
+  return { publicKey: await exportRawPublic(kp), privateKey: kp.privateKey };
+}
+
+/**
+ * Generate an Ed25519 key pair whose private key is a non-extractable
+ * {@link CryptoKey}, for {@link signChallenge}/{@link verifyChallenge}.
+ */
+export async function generateSigningKeyPairHandle(): Promise<KeyPairHandle> {
+  const kp = (await subtle().generateKey({ name: 'Ed25519' }, false, [
+    'sign',
+    'verify',
+  ])) as unknown as NativeKeyPair;
+  return { publicKey: await exportRawPublic(kp), privateKey: kp.privateKey };
+}
+
+/**
+ * Import a base64url PKCS#8 X25519 private key as a reusable, non-extractable
+ * {@link CryptoKey}. Import once and pass the handle to {@link decrypt} to skip
+ * re-importing the key on every message.
+ */
+export function importEncryptionPrivateKey(privateKey: string): Promise<CryptoKey> {
+  return importX25519Private(privateKey);
+}
+
+/**
+ * Import a base64url PKCS#8 Ed25519 private key as a reusable, non-extractable
+ * {@link CryptoKey} for {@link signChallenge}.
+ */
+export function importSigningPrivateKey(privateKey: string): Promise<CryptoKey> {
+  return importEd25519Private(privateKey);
 }
 
 // ── Key encapsulation (HPKE-style) ──────────────────────
@@ -249,14 +347,14 @@ function contentAad(): Bytes {
 }
 
 async function deriveKek(sharedSecret: Bytes, epkRaw: Bytes): Promise<CryptoKey> {
-  const ikm = await subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
+  const ikm = await subtle().importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
   const info = concatBytes(textEncoder.encode(HKDF_INFO_LABEL), epkRaw);
-  const bits = await subtle.deriveBits(
+  const bits = await subtle().deriveBits(
     { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info },
     ikm,
     256,
   );
-  return subtle.importKey('raw', new Uint8Array(bits), { name: 'AES-GCM' }, false, [
+  return subtle().importKey('raw', new Uint8Array(bits), { name: 'AES-GCM' }, false, [
     'encrypt',
     'decrypt',
   ]);
@@ -267,19 +365,19 @@ async function wrapForRecipient(
   recipientId: string,
   recipientPublicKey: string,
 ): Promise<RecipientEntry> {
-  const ephemeral = (await subtle.generateKey({ name: 'X25519' }, true, [
+  const ephemeral = (await subtle().generateKey({ name: 'X25519' }, true, [
     'deriveBits',
-  ])) as unknown as KeyPairHandle;
+  ])) as unknown as NativeKeyPair;
   const recipientPub = await importX25519Public(recipientPublicKey);
   const sharedSecret = new Uint8Array(
-    await subtle.deriveBits({ name: 'X25519', public: recipientPub }, ephemeral.privateKey, 256),
+    await subtle().deriveBits({ name: 'X25519', public: recipientPub }, ephemeral.privateKey, 256),
   );
-  const epkRaw = new Uint8Array(await subtle.exportKey('raw', ephemeral.publicKey));
+  const epkRaw = new Uint8Array(await subtle().exportKey('raw', ephemeral.publicKey));
   const kek = await deriveKek(sharedSecret, epkRaw);
 
   const iv = randomBytes(IV_SIZE);
   const wrapped = new Uint8Array(
-    await subtle.encrypt(
+    await subtle().encrypt(
       { name: 'AES-GCM', iv, additionalData: wrapAad(epkRaw, recipientId) },
       kek,
       cek,
@@ -291,13 +389,13 @@ async function wrapForRecipient(
 async function unwrapContentKey(
   entry: RecipientEntry,
   recipientId: string,
-  privateKey: string,
+  privateKey: string | CryptoKey,
 ): Promise<Bytes> {
   const epkRaw = fromBase64url(entry.epk);
   const ephemeralPub = await importX25519Public(entry.epk);
-  const recipientPriv = await importX25519Private(privateKey);
+  const recipientPriv = await resolveX25519Private(privateKey);
   const sharedSecret = new Uint8Array(
-    await subtle.deriveBits({ name: 'X25519', public: ephemeralPub }, recipientPriv, 256),
+    await subtle().deriveBits({ name: 'X25519', public: ephemeralPub }, recipientPriv, 256),
   );
   const kek = await deriveKek(sharedSecret, epkRaw);
 
@@ -305,7 +403,7 @@ async function unwrapContentKey(
   const iv = raw.subarray(0, IV_SIZE);
   const ciphertext = raw.subarray(IV_SIZE);
   return new Uint8Array(
-    await subtle.decrypt(
+    await subtle().decrypt(
       { name: 'AES-GCM', iv, additionalData: wrapAad(epkRaw, recipientId) },
       kek,
       ciphertext,
@@ -329,24 +427,26 @@ export async function encrypt(plaintext: string, recipients: Recipient[]): Promi
   }
 
   const cek = randomBytes(CEK_SIZE);
-  const contentKey = await subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
+  const contentKey = await subtle().importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
   const iv = randomBytes(IV_SIZE);
   const ciphertext = new Uint8Array(
-    await subtle.encrypt(
+    await subtle().encrypt(
       { name: 'AES-GCM', iv, additionalData: contentAad() },
       contentKey,
       utf8(plaintext),
     ),
   );
 
-  const recipientMap: Record<string, RecipientEntry> = {};
-  for (const recipient of recipients) {
-    recipientMap[recipient.recipientId] = await wrapForRecipient(
-      cek,
-      recipient.recipientId,
-      recipient.publicKey,
-    );
-  }
+  const wrapped = await Promise.all(
+    recipients.map(
+      async (recipient) =>
+        [
+          recipient.recipientId,
+          await wrapForRecipient(cek, recipient.recipientId, recipient.publicKey),
+        ] as const,
+    ),
+  );
+  const recipientMap: Record<string, RecipientEntry> = Object.fromEntries(wrapped);
 
   return {
     v: ENVELOPE_VERSION,
@@ -365,7 +465,7 @@ export async function encrypt(plaintext: string, recipients: Recipient[]): Promi
 export async function decrypt(
   envelope: Envelope,
   recipientId: string,
-  privateKey: string,
+  privateKey: string | CryptoKey,
 ): Promise<string> {
   if (envelope.v !== ENVELOPE_VERSION || envelope.suite !== SUITE_NAME) {
     throw new Error(`Unsupported envelope (v${envelope.v}, suite "${envelope.suite}")`);
@@ -377,8 +477,8 @@ export async function decrypt(
   }
 
   const cek = await unwrapContentKey(entry, recipientId, privateKey);
-  const contentKey = await subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt']);
-  const plaintext = await subtle.decrypt(
+  const contentKey = await subtle().importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt']);
+  const plaintext = await subtle().decrypt(
     { name: 'AES-GCM', iv: fromBase64url(envelope.iv), additionalData: contentAad() },
     contentKey,
     fromBase64url(envelope.ciphertext),
@@ -418,8 +518,7 @@ export function serializeEnvelope(envelope: Envelope): string {
   parts.push(u8(iv.length), iv);
   parts.push(u32(ciphertext.length), ciphertext);
   parts.push(u16(recipientIds.length));
-  for (const id of recipientIds) {
-    const entry = envelope.recipients[id]!;
+  for (const [id, entry] of Object.entries(envelope.recipients)) {
     const idBytes = textEncoder.encode(id);
     const epk = fromBase64url(entry.epk);
     const key = fromBase64url(entry.key);
@@ -462,7 +561,7 @@ export function deserializeEnvelope(blob: string): Envelope {
   p = 4;
 
   need(1);
-  const ivLen = bytes[p++]!;
+  const ivLen = bytes[p++] ?? 0;
   need(ivLen);
   const iv = bytes.subarray(p, p + ivLen);
   p += ivLen;
@@ -543,7 +642,7 @@ export async function encryptToBlob(plaintext: string, recipients: Recipient[]):
 export async function decryptFromBlob(
   blob: string,
   recipientId: string,
-  privateKey: string,
+  privateKey: string | CryptoKey,
 ): Promise<string> {
   return decrypt(deserializeEnvelope(blob), recipientId, privateKey);
 }
@@ -559,15 +658,12 @@ function challengeBytes(nonce: string): Bytes {
  * Sign a nonce with an Ed25519 private key (for challenge-response auth).
  * Returns the base64url signature.
  */
-export async function signChallenge(nonce: string, privateKey: string): Promise<string> {
-  const key = await subtle.importKey(
-    'pkcs8',
-    fromBase64url(privateKey),
-    { name: 'Ed25519' },
-    false,
-    ['sign'],
-  );
-  const sig = await subtle.sign({ name: 'Ed25519' }, key, challengeBytes(nonce));
+export async function signChallenge(
+  nonce: string,
+  privateKey: string | CryptoKey,
+): Promise<string> {
+  const key = await resolveEd25519Private(privateKey);
+  const sig = await subtle().sign({ name: 'Ed25519' }, key, challengeBytes(nonce));
   return toBase64url(new Uint8Array(sig));
 }
 
@@ -581,14 +677,14 @@ export async function verifyChallenge(
   publicKey: string,
 ): Promise<boolean> {
   try {
-    const key = await subtle.importKey(
+    const key = await subtle().importKey(
       'raw',
       fromBase64url(publicKey),
       { name: 'Ed25519' },
       false,
       ['verify'],
     );
-    return await subtle.verify(
+    return await subtle().verify(
       { name: 'Ed25519' },
       key,
       fromBase64url(signature),
