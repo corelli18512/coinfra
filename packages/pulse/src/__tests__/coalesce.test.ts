@@ -43,7 +43,7 @@ describe('COALESCE-BASIC: an offline producer collapses same-key sends to one', 
     expect(seqsOf(w.deliveredB)).toEqual([100n]); // fresh seq, dropped seqs skipped
     // The coalesce hint rides the wire and surfaces on the deliver effect so a
     // bridging hub can re-apply it on the next hop.
-    expect(w.deliveredB[0]?.coalesceKey).toBe('k1');
+    expect(w.deliveredB[0]!.coalesceKey).toBe('k1');
     // Peer was told to skip the 1..99 gap (reset-inbound at the coalesced seq).
     expect(w.resetsB.at(-1)).toEqual({ fromSeq: 100n, peerEpoch: A_EPOCH });
   });
@@ -107,7 +107,7 @@ describe('COALESCE-SNAPSHOT: coalesceKey survives snapshot round-trip', () => {
 
     const snap = w.a.snapshot();
     expect(snap.outbox.length).toBe(1);
-    expect(snap.outbox[0]?.coalesceKey).toBe('k1');
+    expect(snap.outbox[0]!.coalesceKey).toBe('k1');
 
     // Full restart of A from the snapshot.
     const restored = new Endpoint({ epoch: A_EPOCH, random: () => 0.5, restore: snap });
@@ -118,5 +118,77 @@ describe('COALESCE-SNAPSHOT: coalesceKey survives snapshot round-trip', () => {
     const { effects } = restored.send(marker(3), { coalesceKey: 'k1' });
     expect(restored.outboxSize).toBe(1);
     expect(effects).toContainEqual({ t: 'purged', droppedSeqs: [2n], reason: 'coalesced:k1' });
+  });
+});
+
+describe('COALESCE-IN-FLIGHT: an already-transmitted entry is coalesced before ack', () => {
+  it('replaces a transmitted-but-unacked entry, peer gets only the latest', () => {
+    const w = makeWorld();
+    w.connect();
+    // transmit seq=1 (keyed) over the live link — peer receives and delivers it
+    w.sendA(marker(1), { coalesceKey: 'k1' });
+    expect(payloadsOf(w.deliveredB)).toEqual([1]);
+
+    // Now send a second k1 message — this supersedes seq=1 in our outbox even
+    // though seq=1 was already transmitted (but we don't know if the peer
+    // acked it yet because ACKs piggyback on DATA/HEARTBEAT). The new entry
+    // gets seq=2.
+    const { effects } = w.a.send(marker(2), { coalesceKey: 'k1' });
+    expect(w.a.outboxSize).toBe(1);
+    // seq=1 was already delivered, so the purged effect still fires for
+    // observability even though the entry was never durable.
+    expect(effects).toContainEqual({ t: 'purged', droppedSeqs: [1n], reason: 'coalesced:k1' });
+
+    // Pump the new transmit through to the peer.
+    w.pump(effects, 'AtoB');
+    // peer sees seq=2 delivered (seq=1 was already delivered, cursor=1; the
+    // RESET-on-resend from our sparse outbox advances cursor from 1 to skip the
+    // dropped seq=1, then delivers seq=2).
+    expect(payloadsOf(w.deliveredB)).toEqual([1, 2]);
+    expect(seqsOf(w.deliveredB)).toEqual([1n, 2n]);
+  });
+
+  it('replaces an in-flight entry and the next resend carries only the survivor', () => {
+    const w = makeWorld();
+    w.connect();
+    // transmit seq=1 (no coalesce) then seq=2 (keyed)
+    w.sendA(marker(10)); // seq=1
+    w.sendA(marker(20), { coalesceKey: 'k1' }); // seq=2
+    expect(w.deliveredB.length).toBe(2);
+
+    // Disconnect: peer ACKs to cursor 2 but our outbox may still hold
+    // entries the peer hasn't acked. Simulate a lossy disconnect.
+    w.disconnect();
+    // Send a new k1 message — coalesces seq=2 out of the outbox
+    w.sendA(marker(30), { coalesceKey: 'k1' }); // seq=3 (coalesces seq=2)
+    expect(w.a.outboxSize).toBe(2); // seq=1 (unkeyed) + seq=3 (latest k1)
+
+    // Reconnect: outbox resend. seq=2 was already delivered to the peer, but
+    // it was coalesced away from our outbox. resendFrom walks entries in seq
+    // order: seq=1 present, seq=2 GAP (RESET {oldest=3}), seq=3 sent.
+    // The peer cursor advances: 2 → skip to (3-1)=2, delivers seq=3.
+    w.reopen();
+    // peer already delivered seq=1,2 before disconnect. The resend retransmits
+    // seq=1 (duplicate, ignored via ack), then RESET+seq=3.
+    expect(w.deliveredB.at(-1)!.payload).toEqual(marker(30));
+  });
+});
+
+describe('COALESCE-VALIDATION: malformed keys rejected before state mutation', () => {
+  it('throws on a coalesceKey that encodes to >255 UTF-8 bytes', () => {
+    const w = makeWorld();
+    const longKey = 'x'.repeat(256); // 256 bytes
+    expect(() => w.a.send(marker(1), { coalesceKey: longKey })).toThrow(
+      /exceeds 255 bytes/,
+    );
+    // Outbox must be unmodified — no orphaned entry.
+    expect(w.a.outboxSize).toBe(0);
+  });
+
+  it('accepts a coalesceKey of exactly 255 bytes', () => {
+    const w = makeWorld();
+    const maxKey = 'x'.repeat(255);
+    expect(() => w.a.send(marker(1), { coalesceKey: maxKey })).not.toThrow();
+    expect(w.a.outboxSize).toBe(1);
   });
 });
