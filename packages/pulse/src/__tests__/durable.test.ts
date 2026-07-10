@@ -13,7 +13,7 @@
 import { describe, expect, it } from 'vitest';
 import { Endpoint } from '../endpoint.js';
 import { DEFAULT_PARAMS, type Effect } from '../types.js';
-import { decodeFrame } from '../wire.js';
+import { decodeFrame, encodeFrame } from '../wire.js';
 import { marker, payloadsOf, seqsOf, World } from './harness.js';
 
 /** Drive two endpoints by hand, capturing effects. Lets tests inspect store,
@@ -313,3 +313,145 @@ describe('DURABLE-9: durable message survives disconnect via the World harness',
     expect(seqsOf(w.deliveredB)).toEqual([1n]);
   });
 });
+
+// ── 10. outboxBase > sendSeq regression (2026-07-10 prod outage) ───────────
+
+describe('DURABLE-10: outboxBase never exceeds sendSeq (restart wedge fix)', () => {
+  // Reproduces the exact prod failure: the head (durable hub) sends a mix of
+  // durable + non-durable messages. Its peer acks a high recvCursor. The head
+  // restarts from a durable-only snapshot — its sendSeq rewinds (non-durable
+  // sends after the last saveSnapshot are lost) but the peer didn't restart
+  // and still acks the old high recvCursor. Without the clamp, outboxBase
+  // races past sendSeq, and the NEXT time the peer reconnects fresh
+  // (recvCursor=0), its seq=1..N frames are treated as duplicates
+  // (≤ outboxBase) and silently dropped — permanently wedging the link.
+  // With the fix, outboxBase is clamped to sendSeq.
+
+  it('pruneOutbox clamps outboxBase to sendSeq when peer acks ahead', () => {
+    // Head sends durable(1) + non-durable(2,3) → sendSeq=3, then crashes.
+    // On restart it loads a snapshot with sendSeq=3, outboxBase=0 (the last
+    // saveSnapshot was at send time of the durable msg). The peer (still
+    // alive) reconnects with recvCursor=5 (it received 2 MORE non-durable
+    // msgs seq=4,5 that were on the wire but lost in the crash — head's
+    // sendSeq was 5 before crash but only 3 is in the snapshot).
+    //
+    // We simulate this directly: restore sendSeq=3, then feed a HELLO with
+    // recvCursor=5 (ahead of sendSeq=3). pruneOutbox must clamp to 3.
+    const snap = {
+      epoch: 'A', sendSeq: '3', outboxBase: '0',
+      outbox: [{ seq: '1', payloadB64: Buffer.from([1]).toString('base64'), durable: true, sentAt: 0 }],
+      recvCursor: '0', peerEpoch: 'B', disconnectedAtMs: null,
+    } as any;
+    const a = new Endpoint({ epoch: 'A', random: () => 0.5, durable: { supported: true }, restore: snap });
+    expect(a.sendSeqValue).toBe(3n);
+    expect(a.outboxSize).toBe(1); // the durable entry survives
+
+    a.onConnected(0);
+    // Peer B reconnects, resuming A's epoch, with recvCursor=5 (ahead of sendSeq=3).
+    a.onBytes(encodeHelloB('B', 'A', 5n), 0);
+
+    const snap2 = a.snapshot();
+    expect(BigInt(snap2.outboxBase)).toBe(3n); // clamped to sendSeq, NOT 5
+    expect(BigInt(snap2.sendSeq)).toBe(3n);
+  });
+
+  it('loadSnapshot self-heals a corrupted outboxBase > sendSeq', () => {
+    // Simulate a pre-0.3.1 snapshot that was persisted with outboxBase ahead
+    // of sendSeq (the exact prod state: sendSeq=1733, outboxBase=1751).
+    const corrupted = {
+      epoch: 'head:dev_x:1700000000',
+      sendSeq: '1733',
+      outboxBase: '1751', // ← corrupted: ahead of sendSeq
+      outbox: [],
+      recvCursor: '0',
+      peerEpoch: 'tentacle:dev_x:1700000001',
+      disconnectedAtMs: null,
+    };
+    const a = new Endpoint({
+      epoch: 'fresh',
+      random: () => 0.5,
+      durable: { supported: true },
+      restore: corrupted as any,
+    });
+    // The clamp on load prevents the wedge.
+    const snap = a.snapshot();
+    expect(BigInt(snap.outboxBase)).toBe(1733n); // clamped to sendSeq
+    expect(BigInt(snap.sendSeq)).toBe(1733n);
+  });
+
+  it('a fresh peer reconnecting after the clamp is NOT wedged', () => {
+    // End-to-end: after the clamp, a fresh peer (recvCursor=0) receives new
+    // messages (seq=4,5,...) — they are NOT treated as duplicates.
+    // Head loads sendSeq=3, outboxBase=0 (durable entry seq=1 in outbox).
+    const snap = {
+      epoch: 'A', sendSeq: '3', outboxBase: '0',
+      outbox: [{ seq: '1', payloadB64: Buffer.from([1]).toString('base64'), durable: true, sentAt: 0 }],
+      recvCursor: '0', peerEpoch: '', disconnectedAtMs: null,
+    } as any;
+    const a = new Endpoint({ epoch: 'A', random: () => 0.5, durable: { supported: true }, restore: snap });
+
+    // A fresh peer B connects (new epoch, recvCursor=0). A's onHello path
+    // (f.recvCursor=0 < outboxBase=0 is false, 0 >= 0 is true) → pruneOutbox(0)
+    // is a no-op, then resendWithGapAnnounce(1) resends the durable entry.
+    const b = new Endpoint({ epoch: 'B', random: () => 0.5 });
+    const pair = new ManualPair(a, b);
+    pair.connect();
+    // A sends new messages seq=4,5.
+    const sendEffs = [
+      ...a.send(marker(10)).effects,
+      ...a.send(marker(11)).effects,
+    ];
+    pair.flush(sendEffs, 'A');
+    // B received: durable(1) + new(10,11). All delivered, none dropped.
+    expect(payloadsOfDelivered(pair.deliveredB)).toEqual([1, 10, 11]);
+    expect(seqsOfDelivered(pair.deliveredB)).toEqual([1n, 4n, 5n]);
+  });
+});
+
+// ── helpers for DURABLE-10 ─────────────────────────────────────────────────
+
+function encodeHelloB(
+  bEpoch: string,
+  aEpoch: string,
+  recvCursor: bigint,
+): Uint8Array {
+  // Build a HELLO frame from B resuming against A's epoch with a given recvCursor.
+  return encodeFrame({
+    t: 'hello',
+    epoch: bEpoch,
+    recvEpoch: aEpoch,
+    recvCursor,
+    durableSupported: true,
+    maxRetentionMs: 0n,
+  });
+}
+
+class ManualPair {
+  linkUp = false;
+  deliveredB: Array<{ seq: bigint; payload: Uint8Array }> = [];
+  constructor(readonly a: Endpoint, readonly b: Endpoint) {}
+
+  connect(): void {
+    this.linkUp = true;
+    this.flush(this.a.onConnected(0), 'A');
+    this.flush(this.b.onConnected(0), 'B');
+  }
+  flushA(): void {
+    this.flush(this.a.onTick(1), 'A');
+  }
+  private flush(effects: Effect[], from: 'A' | 'B'): void {
+    for (const e of effects) {
+      if (e.t === 'deliver' && from === 'B') this.deliveredB.push({ seq: e.seq, payload: e.payload });
+      if (e.t !== 'transmit' || !this.linkUp) continue;
+      if (from === 'A') this.flush(this.b.onBytes(e.bytes, 1), 'B');
+      else this.flush(this.a.onBytes(e.bytes, 1), 'A');
+    }
+  }
+}
+
+function payloadsOfDelivered(d: Array<{ payload: Uint8Array }>): number[] {
+  return d.map((e) => e.payload[0] ?? -1);
+}
+function seqsOfDelivered(d: Array<{ seq: bigint }>): bigint[] {
+  return d.map((e) => e.seq);
+}

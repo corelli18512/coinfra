@@ -408,15 +408,24 @@ export class Endpoint {
 
   private pruneOutbox(ackSeq: Seq, effects?: Effect[]): void {
     if (ackSeq <= this.outboxBase) return;
+    // Clamp to sendSeq: the peer's recvCursor can exceed our sendSeq after we
+    // restart from a durable-only snapshot (non-durable sends are lost, so
+    // sendSeq was rewound, but the peer kept running and acks a higher seq).
+    // Without this clamp, outboxBase races ahead of sendSeq, and on the NEXT
+    // reconnect the peer (recvCursor=0) sees its fresh seq=1..N as "duplicates"
+    // (≤ outboxBase) and silently drops them — permanently wedging the link.
+    // This was the root cause of the 2026-07-10 kraki prod outage.
+    const clamped = ackSeq > this.sendSeq ? this.sendSeq : ackSeq;
+    if (clamped <= this.outboxBase) return;
     // Any durable entries being pruned are now confirmed delivered — tell the
     // adapter it may delete them from disk.
-    const hadDurable = this.outbox.some((e) => e.seq <= ackSeq && e.durable);
-    this.outbox = this.outbox.filter((e) => e.seq > ackSeq);
-    this.outboxBase = ackSeq;
+    const hadDurable = this.outbox.some((e) => e.seq <= clamped && e.durable);
+    this.outbox = this.outbox.filter((e) => e.seq > clamped);
+    this.outboxBase = clamped;
     // Surface the confirmed delivery floor so the app can resolve/roll back
     // optimistic UI for messages it sent. Observational only.
-    effects?.push({ t: 'acked', seqUpTo: ackSeq });
-    if (hadDurable) effects?.push({ t: 'unstore', seqUpTo: ackSeq });
+    effects?.push({ t: 'acked', seqUpTo: clamped });
+    if (hadDurable) effects?.push({ t: 'unstore', seqUpTo: clamped });
   }
 
   /** Build a transmit effect and mark send activity. `now` optional for the
@@ -591,6 +600,12 @@ export class Endpoint {
     this.epoch = s.epoch;
     this.sendSeq = BigInt(s.sendSeq);
     this.outboxBase = BigInt(s.outboxBase);
+    // Defensive clamp: a snapshot persisted by a pre-0.3.1 version could have
+    // outboxBase > sendSeq (the bug fixed in pruneOutbox above — the peer's
+    // recvCursor raced ahead of our sendSeq after a restart). Loading that
+    // verbatim would re-introduce the wedge on the next reconnect. Clamp here
+    // so corrupted snapshots self-heal on load.
+    if (this.outboxBase > this.sendSeq) this.outboxBase = this.sendSeq;
     this.outbox = s.outbox.map((e) => ({
       seq: BigInt(e.seq),
       payload: b64decode(e.payloadB64),
