@@ -8,7 +8,7 @@ public enum Effect: Equatable {
     /// Hand this payload to the application — in order, exactly once. `durable`
     /// echoes the sender's per-message durable flag so a bridging app can
     /// preserve the intent when forwarding onto another hop. Pure transport info.
-    case deliver(seq: UInt64, payload: [UInt8], durable: Bool)
+    case deliver(seq: UInt64, payload: [UInt8], durable: Bool, coalesceKey: String?)
     /// Begin establishing the link (dial).
     case open
     /// Tear down the current link (dead/stale).
@@ -79,7 +79,7 @@ public struct Snapshot: Equatable {
     public var epoch: String
     public var sendSeq: UInt64
     public var outboxBase: UInt64
-    public var outbox: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int)]
+    public var outbox: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int, coalesceKey: String?)]
     public var recvCursor: UInt64
     public var peerEpoch: String
     public var disconnectedAtMs: Int?
@@ -91,6 +91,7 @@ public struct Snapshot: Equatable {
             && l.outbox.count == r.outbox.count
             && zip(l.outbox, r.outbox).allSatisfy {
                 $0.seq == $1.seq && $0.payload == $1.payload && $0.durable == $1.durable
+                    && $0.coalesceKey == $1.coalesceKey
             }
     }
 }
@@ -106,7 +107,7 @@ public final class Endpoint {
 
     private var epoch: String
     private var sendSeq: UInt64 = 0
-    private var outbox: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int)] = []
+    private var outbox: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int, coalesceKey: String?)] = []
     private var outboxBase: UInt64 = 0
 
     private var recvCursor: UInt64 = 0
@@ -143,18 +144,42 @@ public final class Endpoint {
     // MARK: - Inputs
 
     /// Application wants to send an opaque payload. Returns assigned seq + effects.
-    public func send(_ payload: [UInt8], durable durableFlag: Bool = false) -> (seq: UInt64, effects: [Effect]) {
+    public func send(_ payload: [UInt8], durable durableFlag: Bool = false, coalesceKey: String? = nil) -> (seq: UInt64, effects: [Effect]) {
+        // 1. Mutual exclusion check
+        if coalesceKey != nil && durableFlag {
+            fatalError("coalesceKey requires durable=false")
+        }
+        // 2. Key length validation (>255 UTF-8 bytes → reject before state mutation)
+        if let key = coalesceKey, key.utf8.count > 255 {
+            fatalError("coalesceKey exceeds 255 bytes")
+        }
+        var effects: [Effect] = []
+        // 3. Coalesce on send: drop old outbox entries with same key
+        if let key = coalesceKey {
+            var droppedSeqs: [UInt64] = []
+            var kept: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int, coalesceKey: String?)] = []
+            for e in outbox {
+                if e.coalesceKey == key {
+                    droppedSeqs.append(e.seq)
+                } else {
+                    kept.append(e)
+                }
+            }
+            outbox = kept
+            if !droppedSeqs.isEmpty {
+                effects.append(.purged(droppedSeqs: droppedSeqs, reason: "coalesced:\(key)"))
+            }
+        }
         sendSeq += 1
         let seq = sendSeq
         // Durable only if the app asked AND we can persist (spec §8.1).
         let isDurable = durableFlag && durable.supported
         // Outbox entry created BEFORE any transmit (spec §3 ordering rule).
-        outbox.append((seq: seq, payload: payload, durable: isDurable, sentAt: clock))
-        var effects: [Effect] = []
+        outbox.append((seq: seq, payload: payload, durable: isDurable, sentAt: clock, coalesceKey: coalesceKey))
         if isDurable { effects.append(.store(seq: seq, payload: payload)) }
         if state == .connected {
             let wireDurable = durableFlag && peerDurableSupported
-            effects.append(transmit(.data(seq: seq, ack: recvCursor, payload: payload, durable: wireDurable)))
+            effects.append(transmit(.data(seq: seq, ack: recvCursor, payload: payload, durable: wireDurable, coalesceKey: coalesceKey)))
         }
         return (seq, effects)
     }
@@ -197,8 +222,8 @@ public final class Endpoint {
             return onHello(
                 epoch: epoch, recvEpoch: recvEpoch, recvCursor: recvCursor,
                 durableSupported: durableSupported, now: now)
-        case let .data(seq, ack, payload, durable):
-            return onData(seq: seq, ack: ack, payload: payload, durable: durable, now: now)
+        case let .data(seq, ack, payload, durable, coalesceKey):
+            return onData(seq: seq, ack: ack, payload: payload, durable: durable, coalesceKey: coalesceKey, now: now)
         case let .ack(ack):
             return onPeerCursor(ack, now)
         case let .reset(epoch, oldest):
@@ -277,12 +302,12 @@ public final class Endpoint {
         return effects
     }
 
-    private func onData(seq: UInt64, ack: UInt64, payload: [UInt8], durable: Bool, now: Int) -> [Effect] {
+    private func onData(seq: UInt64, ack: UInt64, payload: [UInt8], durable: Bool, coalesceKey: String?, now: Int) -> [Effect] {
         var effects: [Effect] = []
         pruneOutbox(ack, &effects)  // peer piggybacks its receipt of our outbound
         if seq == recvCursor + 1 {
             recvCursor = seq
-            effects.append(.deliver(seq: seq, payload: payload, durable: durable))
+            effects.append(.deliver(seq: seq, payload: payload, durable: durable, coalesceKey: coalesceKey))
         } else if seq <= recvCursor {
             // Duplicate (a resend because our earlier ack was lost). Re-advertise
             // our cursor so the sender learns we have it and stops resending —
@@ -335,7 +360,7 @@ public final class Endpoint {
             }
             let wireDurable = e.durable && peerDurableSupported
             effects.append(
-                transmit(.data(seq: e.seq, ack: recvCursor, payload: e.payload, durable: wireDurable), now: now))
+                transmit(.data(seq: e.seq, ack: recvCursor, payload: e.payload, durable: wireDurable, coalesceKey: e.coalesceKey), now: now))
             expectedNext = e.seq + 1
         }
     }
@@ -429,7 +454,7 @@ public final class Endpoint {
         var droppedSeqs: [UInt64] = []
         var hadDurable = false
         var maxDroppedDurableSeq: UInt64 = 0
-        var kept: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int)] = []
+        var kept: [(seq: UInt64, payload: [UInt8], durable: Bool, sentAt: Int, coalesceKey: String?)] = []
         for e in outbox {
             if predicate(e.seq, e.durable, e.sentAt, e.payload.count) {
                 droppedSeqs.append(e.seq)

@@ -99,15 +99,15 @@ final class World {
     // MARK: - Application send
 
     @discardableResult
-    func sendA(_ payload: [UInt8], durable: Bool = false) -> UInt64 {
-        let (seq, effects) = a.send(payload, durable: durable)
+    func sendA(_ payload: [UInt8], durable: Bool = false, coalesceKey: String? = nil) -> UInt64 {
+        let (seq, effects) = a.send(payload, durable: durable, coalesceKey: coalesceKey)
         pump(effects, .aToB)
         return seq
     }
 
     @discardableResult
-    func sendB(_ payload: [UInt8], durable: Bool = false) -> UInt64 {
-        let (seq, effects) = b.send(payload, durable: durable)
+    func sendB(_ payload: [UInt8], durable: Bool = false, coalesceKey: String? = nil) -> UInt64 {
+        let (seq, effects) = b.send(payload, durable: durable, coalesceKey: coalesceKey)
         pump(effects, .bToA)
         return seq
     }
@@ -137,7 +137,7 @@ final class World {
         switch e {
         case let .transmit(bytes):
             enqueue((dir: dir, bytes: bytes))
-        case let .deliver(seq, payload, _):
+        case let .deliver(seq, payload, _, _):
             if producedByA { deliveredA.append((seq, payload)) }
             else { deliveredB.append((seq, payload)) }
         case let .resetInbound(fromSeq, peerEpoch):

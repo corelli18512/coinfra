@@ -59,7 +59,8 @@ final class WireTests: XCTestCase {
             return .data(
                 seq: UInt64(x["seq"]!.str)!, ack: UInt64(x["ack"]!.str)!,
                 payload: unhex(x["payloadHex"]!.str),
-                durable: x["durable"]?.bool ?? false)
+                durable: x["durable"]?.bool ?? false,
+                coalesceKey: x["coalesceKey"]?.str)
         case "ack":
             return .ack(ack: UInt64(x["ack"]!.str)!)
         case "reset":
@@ -104,7 +105,7 @@ final class WireTests: XCTestCase {
 
     func testPreservesSeqBeyond53Bits() throws {
         let big: UInt64 = (1 << 63) + 12345
-        let f: Frame = .data(seq: big, ack: 0, payload: [], durable: false)
+        let f: Frame = .data(seq: big, ack: 0, payload: [], durable: false, coalesceKey: nil)
         let rt = decodeFrame(try encodeFrame(f))
         XCTAssertEqual(rt, f)
     }

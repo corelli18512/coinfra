@@ -23,7 +23,7 @@ public enum FrameType: UInt8 {
 /// A decoded protocol frame.
 public enum Frame: Equatable {
     case hello(epoch: String, recvEpoch: String, recvCursor: UInt64, durableSupported: Bool, maxRetentionMs: UInt64)
-    case data(seq: UInt64, ack: UInt64, payload: [UInt8], durable: Bool)
+    case data(seq: UInt64, ack: UInt64, payload: [UInt8], durable: Bool, coalesceKey: String?)
     case ack(ack: UInt64)
     case reset(epoch: String, oldest: UInt64)
     case heartbeat(ack: UInt64)
@@ -80,12 +80,13 @@ public func encodeFrame(_ f: Frame) throws -> [UInt8] {
         w.u64(recvCursor)
         w.u8(durableSupported ? 1 : 0)
         w.u64(maxRetentionMs)
-    case let .data(seq, ack, payload, durable):
+    case let .data(seq, ack, payload, durable, coalesceKey):
         w.header(.data)
-        w.u8(durable ? 1 : 0)
+        w.u8((durable ? 1 : 0) | (coalesceKey != nil ? 2 : 0))
         w.u64(seq)
         w.u64(ack)
         w.blob(payload)
+        if let key = coalesceKey { try w.str(key) }
     case let .ack(ack):
         w.header(.ack)
         w.u64(ack)
@@ -170,7 +171,9 @@ public func decodeFrame(_ bytes: [UInt8]) -> Frame? {
             let seq = try r.u64()
             let ack = try r.u64()
             let payload = try r.blob()
-            return .data(seq: seq, ack: ack, payload: payload, durable: (msgFlags & 1) == 1)
+            let hasKey = (msgFlags & 2) == 2
+            let coalesceKey: String? = hasKey ? try r.str() : nil
+            return .data(seq: seq, ack: ack, payload: payload, durable: (msgFlags & 1) == 1, coalesceKey: coalesceKey)
         case .ack:
             return .ack(ack: try r.u64())
         case .reset:
