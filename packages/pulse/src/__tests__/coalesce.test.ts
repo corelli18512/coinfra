@@ -207,10 +207,7 @@ describe('COALESCE-ONLINE-REPAIR: duplicate hole ACKs do not amplify recovery', 
 
     const initialBurst: Uint8Array[] = [];
     for (let i = 2; i <= 64; i++) {
-      collectTransmits(
-        a.send(marker(i), { coalesceKey: 'delta:session-1' }).effects,
-        initialBurst,
-      );
+      collectTransmits(a.send(marker(i), { coalesceKey: 'delta:session-1' }).effects, initialBurst);
     }
     const echo = a.send(marker(200));
     collectTransmits(echo.effects, initialBurst);
@@ -296,9 +293,7 @@ describe('COALESCE-VALIDATION: malformed keys rejected before state mutation', (
   it('throws on a coalesceKey that encodes to >255 UTF-8 bytes', () => {
     const w = makeWorld();
     const longKey = 'x'.repeat(256); // 256 bytes
-    expect(() => w.a.send(marker(1), { coalesceKey: longKey })).toThrow(
-      /exceeds 255 bytes/,
-    );
+    expect(() => w.a.send(marker(1), { coalesceKey: longKey })).toThrow(/exceeds 255 bytes/);
     // Outbox must be unmodified — no orphaned entry.
     expect(w.a.outboxSize).toBe(0);
   });

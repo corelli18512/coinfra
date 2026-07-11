@@ -107,7 +107,10 @@ export class Endpoint {
     // Validate key length before any state mutation (encodeFrame will later
     // throw RangeError for keys >255 UTF-8 bytes, but by then the outbox is
     // already mutated and the caller has no seq — the entry is orphaned).
-    if (opts?.coalesceKey !== undefined && new TextEncoder().encode(opts.coalesceKey).length > 255) {
+    if (
+      opts?.coalesceKey !== undefined &&
+      new TextEncoder().encode(opts.coalesceKey).length > 255
+    ) {
       throw new Error('coalesceKey exceeds 255 bytes');
     }
     const effects: Effect[] = [];
@@ -541,13 +544,23 @@ export class Endpoint {
    *
    * See spec §11.
    */
-  purge(predicate: (e: { seq: Seq; durable: boolean; sentAt: number; byteLength: number }) => boolean, reason = 'host'): { droppedSeqs: Seq[]; effects: Effect[] } {
+  purge(
+    predicate: (e: { seq: Seq; durable: boolean; sentAt: number; byteLength: number }) => boolean,
+    reason = 'host',
+  ): { droppedSeqs: Seq[]; effects: Effect[] } {
     const droppedSeqs: Seq[] = [];
     let hadDurable = false;
     let maxDroppedDurableSeq: Seq = 0n;
     const kept: OutboxEntry[] = [];
     for (const e of this.outbox) {
-      if (predicate({ seq: e.seq, durable: e.durable, sentAt: e.sentAt, byteLength: e.payload.byteLength })) {
+      if (
+        predicate({
+          seq: e.seq,
+          durable: e.durable,
+          sentAt: e.sentAt,
+          byteLength: e.payload.byteLength,
+        })
+      ) {
         droppedSeqs.push(e.seq);
         if (e.durable) {
           hadDurable = true;

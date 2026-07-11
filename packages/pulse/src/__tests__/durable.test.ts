@@ -338,11 +338,22 @@ describe('DURABLE-10: outboxBase never exceeds sendSeq (restart wedge fix)', () 
     // We simulate this directly: restore sendSeq=3, then feed a HELLO with
     // recvCursor=5 (ahead of sendSeq=3). pruneOutbox must clamp to 3.
     const snap = {
-      epoch: 'A', sendSeq: '3', outboxBase: '0',
-      outbox: [{ seq: '1', payloadB64: Buffer.from([1]).toString('base64'), durable: true, sentAt: 0 }],
-      recvCursor: '0', peerEpoch: 'B', disconnectedAtMs: null,
+      epoch: 'A',
+      sendSeq: '3',
+      outboxBase: '0',
+      outbox: [
+        { seq: '1', payloadB64: Buffer.from([1]).toString('base64'), durable: true, sentAt: 0 },
+      ],
+      recvCursor: '0',
+      peerEpoch: 'B',
+      disconnectedAtMs: null,
     } as any;
-    const a = new Endpoint({ epoch: 'A', random: () => 0.5, durable: { supported: true }, restore: snap });
+    const a = new Endpoint({
+      epoch: 'A',
+      random: () => 0.5,
+      durable: { supported: true },
+      restore: snap,
+    });
     expect(a.sendSeqValue).toBe(3n);
     expect(a.outboxSize).toBe(1); // the durable entry survives
 
@@ -384,11 +395,22 @@ describe('DURABLE-10: outboxBase never exceeds sendSeq (restart wedge fix)', () 
     // messages (seq=4,5,...) — they are NOT treated as duplicates.
     // Head loads sendSeq=3, outboxBase=0 (durable entry seq=1 in outbox).
     const snap = {
-      epoch: 'A', sendSeq: '3', outboxBase: '0',
-      outbox: [{ seq: '1', payloadB64: Buffer.from([1]).toString('base64'), durable: true, sentAt: 0 }],
-      recvCursor: '0', peerEpoch: '', disconnectedAtMs: null,
+      epoch: 'A',
+      sendSeq: '3',
+      outboxBase: '0',
+      outbox: [
+        { seq: '1', payloadB64: Buffer.from([1]).toString('base64'), durable: true, sentAt: 0 },
+      ],
+      recvCursor: '0',
+      peerEpoch: '',
+      disconnectedAtMs: null,
     } as any;
-    const a = new Endpoint({ epoch: 'A', random: () => 0.5, durable: { supported: true }, restore: snap });
+    const a = new Endpoint({
+      epoch: 'A',
+      random: () => 0.5,
+      durable: { supported: true },
+      restore: snap,
+    });
 
     // A fresh peer B connects (new epoch, recvCursor=0). A's onHello path
     // (f.recvCursor=0 < outboxBase=0 is false, 0 >= 0 is true) → pruneOutbox(0)
@@ -397,10 +419,7 @@ describe('DURABLE-10: outboxBase never exceeds sendSeq (restart wedge fix)', () 
     const pair = new ManualPair(a, b);
     pair.connect();
     // A sends new messages seq=4,5.
-    const sendEffs = [
-      ...a.send(marker(10)).effects,
-      ...a.send(marker(11)).effects,
-    ];
+    const sendEffs = [...a.send(marker(10)).effects, ...a.send(marker(11)).effects];
     pair.flush(sendEffs, 'A');
     // B received: durable(1) + new(10,11). All delivered, none dropped.
     expect(payloadsOfDelivered(pair.deliveredB)).toEqual([1, 10, 11]);
@@ -410,11 +429,7 @@ describe('DURABLE-10: outboxBase never exceeds sendSeq (restart wedge fix)', () 
 
 // ── helpers for DURABLE-10 ─────────────────────────────────────────────────
 
-function encodeHelloB(
-  bEpoch: string,
-  aEpoch: string,
-  recvCursor: bigint,
-): Uint8Array {
+function encodeHelloB(bEpoch: string, aEpoch: string, recvCursor: bigint): Uint8Array {
   // Build a HELLO frame from B resuming against A's epoch with a given recvCursor.
   return encodeFrame({
     t: 'hello',
@@ -429,7 +444,10 @@ function encodeHelloB(
 class ManualPair {
   linkUp = false;
   deliveredB: Array<{ seq: bigint; payload: Uint8Array }> = [];
-  constructor(readonly a: Endpoint, readonly b: Endpoint) {}
+  constructor(
+    readonly a: Endpoint,
+    readonly b: Endpoint,
+  ) {}
 
   connect(): void {
     this.linkUp = true;
@@ -441,7 +459,8 @@ class ManualPair {
   }
   flush(effects: Effect[], from: 'A' | 'B'): void {
     for (const e of effects) {
-      if (e.t === 'deliver' && from === 'B') this.deliveredB.push({ seq: e.seq, payload: e.payload });
+      if (e.t === 'deliver' && from === 'B')
+        this.deliveredB.push({ seq: e.seq, payload: e.payload });
       if (e.t !== 'transmit' || !this.linkUp) continue;
       if (from === 'A') this.flush(this.b.onBytes(e.bytes, 1), 'B');
       else this.flush(this.a.onBytes(e.bytes, 1), 'A');
