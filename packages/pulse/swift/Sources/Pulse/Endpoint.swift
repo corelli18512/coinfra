@@ -121,6 +121,10 @@ public final class Endpoint {
     private var lastSendAt: Int = 0
     private var reconnectAt: Int?
     private var attempt: Int = 0
+    /// Peer cursor currently being repaired. Duplicate ACKs for the same cursor
+    /// are suppressed until it advances or the bounded retry deadline expires.
+    private var repairCursor: UInt64?
+    private var repairSentAt: Int = 0
     private var clock: Int = 0
     /// Wall-clock ms of the most recent Connected → Disconnected transition,
     /// or nil while Connected. Preserved across snapshot/restore so a host
@@ -190,6 +194,7 @@ public final class Endpoint {
         disconnectedAt = nil
         attempt = 0
         reconnectAt = nil
+        repairCursor = nil
         lastRecvAt = now
         var effects: [Effect] = []
         effects.append(
@@ -204,6 +209,7 @@ public final class Endpoint {
     public func onDisconnected(_ now: Int) -> [Effect] {
         clock = now
         state = .disconnected
+        repairCursor = nil
         // Stamp the disconnect time only on the first Connected → Disconnected
         // transition — repeated calls (e.g. adapter idempotency) must not reset
         // the age a host GC policy is measuring against. See §11.
@@ -238,6 +244,14 @@ public final class Endpoint {
         var effects: [Effect] = []
         expireDurable(now, &effects)
         if state == .connected {
+            // A repair batch can itself be lost. Retry it on a bounded timer,
+            // but do not let every duplicate ACK clone the retained suffix.
+            if let cursor = repairCursor,
+               cursor < sendSeq,
+               now - repairSentAt >= params.heartbeatIntervalMs {
+                repairSentAt = now
+                resendWithGapAnnounce(cursor + 1, &effects, now)
+            }
             if now - lastSendAt >= params.heartbeatIntervalMs {
                 effects.append(transmit(.heartbeat(ack: recvCursor), now: now))
             }
@@ -326,10 +340,21 @@ public final class Endpoint {
     /// tail-loss and holes self-heal without a reconnect.
     private func onPeerCursor(_ peerCursor: UInt64, _ now: Int) -> [Effect] {
         var effects: [Effect] = []
+        // ACKs are cumulative. An older ACK after a higher cursor was already
+        // pruned is stale/in-flight and must never rewind recovery.
+        if peerCursor < outboxBase { return effects }
         pruneOutbox(peerCursor, &effects)
-        if peerCursor < sendSeq {
-            resendWithGapAnnounce(peerCursor + 1, &effects, now)
+        if peerCursor >= sendSeq {
+            repairCursor = nil
+            return effects
         }
+        // A burst behind one missing DATA can queue many identical ACKs before
+        // the first repair crosses the wire. Emit one bounded repair batch;
+        // onTick retries it if that batch itself is lost.
+        if repairCursor == peerCursor { return effects }
+        repairCursor = peerCursor
+        repairSentAt = now
+        resendWithGapAnnounce(peerCursor + 1, &effects, now)
         return effects
     }
 
@@ -370,25 +395,24 @@ public final class Endpoint {
     /// (e.g. non-durable lost in a restart) and can never be filled — without the
     /// RESET the peer treats the resend as a hole, re-ACKs, and we livelock.
     private func resendWithGapAnnounce(_ fromSeq: UInt64, _ effects: inout [Effect], _ now: Int) {
-        if let oldest = oldestRetainedSeq(), oldest > fromSeq {
-            effects.append(transmit(.reset(epoch: epoch, oldest: oldest), now: now))
-        }
+        // resendFrom already injects RESET exactly where the sparse outbox first
+        // skips sequence space. A second head RESET duplicates the same control.
         resendFrom(fromSeq, &effects, now)
-    }
-
-    private func oldestRetainedSeq() -> UInt64? {
-        outbox.map { $0.seq }.min()
     }
 
     private func pruneOutbox(_ ackSeq: UInt64, _ effects: inout [Effect]) {
         if ackSeq <= outboxBase { return }
-        let hadDurable = outbox.contains { $0.seq <= ackSeq && $0.durable }
-        outbox.removeAll { $0.seq <= ackSeq }
-        outboxBase = ackSeq
+        // Clamp peer state to the highest seq this incarnation has assigned.
+        let clamped = min(ackSeq, sendSeq)
+        if clamped <= outboxBase { return }
+        let hadDurable = outbox.contains { $0.seq <= clamped && $0.durable }
+        outbox.removeAll { $0.seq <= clamped }
+        outboxBase = clamped
+        if let cursor = repairCursor, clamped > cursor { repairCursor = nil }
         // Surface the confirmed delivery floor so the app can resolve/roll back
         // optimistic UI for messages it sent. Observational only.
-        effects.append(.acked(seqUpTo: ackSeq))
-        if hadDurable { effects.append(.unstore(seqUpTo: ackSeq)) }
+        effects.append(.acked(seqUpTo: clamped))
+        if hadDurable { effects.append(.unstore(seqUpTo: clamped)) }
     }
 
     private func transmit(_ frame: Frame, now: Int? = nil) -> Effect {
@@ -409,7 +433,11 @@ public final class Endpoint {
 
     public func nextDeadline() -> Int? {
         if state == .connected {
-            return min(lastSendAt + params.heartbeatIntervalMs, lastRecvAt + params.deadAfterMs)
+            let repairDeadline = repairCursor.map { _ in repairSentAt + params.heartbeatIntervalMs } ?? Int.max
+            return min(
+                lastSendAt + params.heartbeatIntervalMs,
+                lastRecvAt + params.deadAfterMs,
+                repairDeadline)
         }
         return reconnectAt
     }

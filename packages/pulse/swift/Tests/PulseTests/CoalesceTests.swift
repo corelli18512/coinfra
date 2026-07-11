@@ -199,6 +199,110 @@ final class CoalesceTests: XCTestCase {
         XCTAssertEqual(a.outboxSize, 1)
     }
 
+    // MARK: - 9. Online repair amplification
+
+    /// Many duplicate hole ACKs queued before the first repair arrives must
+    /// produce one bounded RESET+suffix batch, not one full resend per ACK.
+    func testDuplicateHoleAcksDoNotAmplifyRepair() {
+        let a = Endpoint(epoch: "A", random: { 0.5 })
+        let b = Endpoint(epoch: "B", random: { 0.5 })
+
+        func transmits(_ effects: [Effect]) -> [[UInt8]] {
+            effects.compactMap {
+                if case let .transmit(bytes) = $0 { return bytes }
+                return nil
+            }
+        }
+
+        let helloA = transmits(a.onConnected(0))[0]
+        let helloB = transmits(b.onConnected(0))[0]
+        _ = b.onBytes(helloA, 0)
+        _ = a.onBytes(helloB, 0)
+
+        // Lose seq=1. Queue 63 replacements and one ordinary echo before any
+        // ACK returns, so B emits 64 identical ACK(0)s.
+        _ = a.send(marker(1), coalesceKey: "delta:session-1")
+        var initialBurst: [[UInt8]] = []
+        for i in 2...64 {
+            initialBurst += transmits(a.send(marker(i), coalesceKey: "delta:session-1").effects)
+        }
+        let echo = a.send(marker(200))
+        initialBurst += transmits(echo.effects)
+        XCTAssertEqual(echo.seq, 65)
+
+        var staleAcks: [[UInt8]] = []
+        for bytes in initialBurst { staleAcks += transmits(b.onBytes(bytes, 1)) }
+        XCTAssertEqual(staleAcks.count, 64)
+
+        var repair: [[UInt8]] = []
+        for bytes in staleAcks { repair += transmits(a.onBytes(bytes, 2)) }
+        XCTAssertEqual(repair.count, 3)
+        XCTAssertEqual(repair.compactMap(decodeFrame), [
+            .reset(epoch: "A", oldest: 64),
+            .data(seq: 64, ack: 0, payload: marker(64), durable: false, coalesceKey: "delta:session-1"),
+            .data(seq: 65, ack: 0, payload: marker(200), durable: false, coalesceKey: nil),
+        ])
+
+        var delivered: [(UInt64, Int)] = []
+        for bytes in repair {
+            for effect in b.onBytes(bytes, 3) {
+                if case let .deliver(seq, payload, _, _) = effect {
+                    delivered.append((seq, Int(payload[0])))
+                }
+            }
+        }
+        XCTAssertEqual(delivered.map { $0.0 }, [64, 65])
+        XCTAssertEqual(delivered.map { $0.1 }, [64, 200])
+    }
+
+    /// A completely lost repair batch is retried once after the heartbeat
+    /// interval; duplicate ACKs before that deadline remain suppressed.
+    func testLostRepairRetriesAfterHeartbeatInterval() {
+        let params = PulseParams(heartbeatIntervalMs: 100, deadAfterMs: 1_000)
+        let a = Endpoint(epoch: "A", params: params, random: { 0.5 })
+        let b = Endpoint(epoch: "B", params: params, random: { 0.5 })
+
+        func transmits(_ effects: [Effect]) -> [[UInt8]] {
+            effects.compactMap {
+                if case let .transmit(bytes) = $0 { return bytes }
+                return nil
+            }
+        }
+
+        let helloA = transmits(a.onConnected(0))[0]
+        let helloB = transmits(b.onConnected(0))[0]
+        _ = b.onBytes(helloA, 0)
+        _ = a.onBytes(helloB, 0)
+
+        _ = a.send(marker(1), coalesceKey: "delta") // lost
+        let seq2 = transmits(a.send(marker(2), coalesceKey: "delta").effects)[0]
+        let ack0 = transmits(b.onBytes(seq2, 1))[0]
+
+        let firstRepair = transmits(a.onBytes(ack0, 2))
+        XCTAssertEqual(firstRepair.compactMap(decodeFrame), [
+            .reset(epoch: "A", oldest: 2),
+            .data(seq: 2, ack: 0, payload: marker(2), durable: false, coalesceKey: "delta"),
+        ])
+        XCTAssertTrue(transmits(a.onBytes(ack0, 50)).isEmpty)
+        XCTAssertTrue(transmits(a.onTick(101)).isEmpty)
+
+        let retry = transmits(a.onTick(102))
+        XCTAssertEqual(retry.compactMap(decodeFrame), [
+            .reset(epoch: "A", oldest: 2),
+            .data(seq: 2, ack: 0, payload: marker(2), durable: false, coalesceKey: "delta"),
+        ])
+
+        var delivered: [Int] = []
+        for bytes in retry {
+            for effect in b.onBytes(bytes, 103) {
+                if case let .deliver(_, payload, _, _) = effect {
+                    delivered.append(Int(payload[0]))
+                }
+            }
+        }
+        XCTAssertEqual(delivered, [2])
+    }
+
     // MARK: - Helpers
 
     func makeWorld() -> World {

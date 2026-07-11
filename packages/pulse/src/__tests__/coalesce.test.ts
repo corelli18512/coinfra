@@ -13,6 +13,8 @@
 
 import { describe, expect, it } from 'vitest';
 import { Endpoint } from '../endpoint.js';
+import type { Effect } from '../types.js';
+import { decodeFrame } from '../wire.js';
 import { marker, payloadsOf, seqsOf, World } from './harness.js';
 
 const A_EPOCH = 'node-A';
@@ -171,6 +173,122 @@ describe('COALESCE-IN-FLIGHT: an already-transmitted entry is coalesced before a
     // peer already delivered seq=1,2 before disconnect. The resend retransmits
     // seq=1 (duplicate, ignored via ack), then RESET+seq=3.
     expect(w.deliveredB.at(-1)!.payload).toEqual(marker(30));
+  });
+});
+
+describe('COALESCE-ONLINE-REPAIR: duplicate hole ACKs do not amplify recovery', () => {
+  it('queues one bounded repair batch, not one full resend per stale ACK', () => {
+    const random = () => 0.5;
+    const a = new Endpoint({ epoch: A_EPOCH, random });
+    const b = new Endpoint({ epoch: B_EPOCH, random });
+
+    // Complete the HELLO exchange without introducing any transport fault.
+    const aToB: Uint8Array[] = [];
+    const bToA: Uint8Array[] = [];
+    const collectTransmits = (effects: Effect[], wire: Uint8Array[]): void => {
+      for (const effect of effects) {
+        if (effect.t === 'transmit') wire.push(effect.bytes);
+      }
+    };
+    collectTransmits(a.onConnected(0), aToB);
+    collectTransmits(b.onConnected(0), bToA);
+    while (aToB.length > 0 || bToA.length > 0) {
+      while (aToB.length > 0) collectTransmits(b.onBytes(aToB.shift()!, 0), bToA);
+      while (bToA.length > 0) collectTransmits(a.onBytes(bToA.shift()!, 0), aToB);
+    }
+
+    // Lose the first live coalesced DATA. Before its ACK can return, producer A
+    // emits a burst of replacements plus one ordinary, unkeyed echo. This is a
+    // deterministic model of a non-zero-RTT link: B sees every later seq as a
+    // hole and sends the same ACK(0) for each one.
+    const lost = a.send(marker(1), { coalesceKey: 'delta:session-1' });
+    expect(lost.effects.some((effect) => effect.t === 'transmit')).toBe(true);
+    // Intentionally do not put seq=1 on the wire.
+
+    const initialBurst: Uint8Array[] = [];
+    for (let i = 2; i <= 64; i++) {
+      collectTransmits(
+        a.send(marker(i), { coalesceKey: 'delta:session-1' }).effects,
+        initialBurst,
+      );
+    }
+    const echo = a.send(marker(200));
+    collectTransmits(echo.effects, initialBurst);
+    expect(echo.seq).toBe(65n);
+    expect(a.outboxSize).toBe(2); // latest delta + ordinary echo
+
+    const staleAcks: Uint8Array[] = [];
+    for (const bytes of initialBurst) collectTransmits(b.onBytes(bytes, 1), staleAcks);
+    expect(staleAcks).toHaveLength(64);
+    expect(
+      staleAcks.every((bytes) => {
+        const frame = decodeFrame(bytes);
+        return frame?.t === 'ack' && frame.ack === 0n;
+      }),
+    ).toBe(true);
+
+    // All duplicate ACK(0)s are already queued before A's first repair can make
+    // the round trip. Processing them must not enqueue 64 copies of the same
+    // RESET + retained suffix. One repair batch is exactly:
+    //   RESET(oldest=64), DATA(64 latest delta), DATA(65 ordinary echo).
+    const repairWire: Uint8Array[] = [];
+    for (const bytes of staleAcks) collectTransmits(a.onBytes(bytes, 2), repairWire);
+    const repairTypes = repairWire.map((bytes) => decodeFrame(bytes)?.t);
+    expect(repairTypes).toHaveLength(3);
+    expect(repairTypes).toEqual(['reset', 'data', 'data']);
+
+    // That single bounded repair must deliver the ordinary echo immediately;
+    // no heartbeat, reconnect, or pause in the coalesced stream is required.
+    const delivered: Array<{ seq: bigint; marker: number }> = [];
+    for (const bytes of repairWire) {
+      for (const effect of b.onBytes(bytes, 3)) {
+        if (effect.t === 'deliver') {
+          delivered.push({ seq: effect.seq, marker: effect.payload[0] ?? -1 });
+        }
+      }
+    }
+    expect(delivered).toEqual([
+      { seq: 64n, marker: 64 },
+      { seq: 65n, marker: 200 },
+    ]);
+  });
+
+  it('retries a lost bounded repair after the heartbeat interval', () => {
+    const params = { heartbeatIntervalMs: 100, deadAfterMs: 1_000 };
+    const a = new Endpoint({ epoch: A_EPOCH, params, random: () => 0.5 });
+    const b = new Endpoint({ epoch: B_EPOCH, params, random: () => 0.5 });
+    const transmits = (effects: Effect[]): Uint8Array[] =>
+      effects.flatMap((effect) => (effect.t === 'transmit' ? [effect.bytes] : []));
+
+    // Install peer capabilities/epochs. No application data is exchanged here.
+    const helloA = transmits(a.onConnected(0))[0]!;
+    const helloB = transmits(b.onConnected(0))[0]!;
+    b.onBytes(helloA, 0);
+    a.onBytes(helloB, 0);
+
+    // seq=1 is lost; seq=2 replaces it and creates ACK(0).
+    a.send(marker(1), { coalesceKey: 'delta' });
+    const seq2 = transmits(a.send(marker(2), { coalesceKey: 'delta' }).effects)[0]!;
+    const ack0 = transmits(b.onBytes(seq2, 1))[0]!;
+
+    const firstRepair = transmits(a.onBytes(ack0, 2));
+    expect(firstRepair.map((bytes) => decodeFrame(bytes)?.t)).toEqual(['reset', 'data']);
+    // Drop the complete first repair batch. Duplicate ACK before the deadline
+    // remains suppressed.
+    expect(transmits(a.onBytes(ack0, 50))).toHaveLength(0);
+    expect(transmits(a.onTick(101))).toHaveLength(0);
+
+    // At repairSentAt(2) + heartbeat(100), retry exactly one bounded batch.
+    const retry = transmits(a.onTick(102));
+    expect(retry.map((bytes) => decodeFrame(bytes)?.t)).toEqual(['reset', 'data']);
+
+    const delivered: number[] = [];
+    for (const bytes of retry) {
+      for (const effect of b.onBytes(bytes, 103)) {
+        if (effect.t === 'deliver') delivered.push(effect.payload[0] ?? -1);
+      }
+    }
+    expect(delivered).toEqual([2]);
   });
 });
 

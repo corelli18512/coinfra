@@ -72,6 +72,10 @@ export class Endpoint {
   private lastSendAt = 0;
   private reconnectAt: number | null = null;
   private attempt = 0;
+  /** Peer cursor currently being repaired. Duplicate ACKs for the same cursor
+   *  are suppressed until it advances or the bounded retry deadline expires. */
+  private repairCursor: Seq | null = null;
+  private repairSentAt = 0;
   /** Last-known clock (ms), updated on every timed input. Used to stamp sentAt
    *  on send() which has no `now` of its own. */
   private clock = 0;
@@ -164,6 +168,7 @@ export class Endpoint {
     this.disconnectedAt = null;
     this.attempt = 0;
     this.reconnectAt = null;
+    this.repairCursor = null;
     this.lastRecvAt = now; // give the fresh link a full dead-window grace
     const effects: Effect[] = [];
     effects.push(
@@ -185,6 +190,7 @@ export class Endpoint {
   onDisconnected(now: number): Effect[] {
     this.clock = now;
     this.state = LinkState.Disconnected;
+    this.repairCursor = null;
     // Stamp the disconnect time only on the first Connected → Disconnected
     // transition — repeated calls (e.g. from adapter idempotency) must not
     // reset the age a host GC policy is measuring against.
@@ -225,6 +231,16 @@ export class Endpoint {
     // and tell the adapter to delete them from disk. They will never be resent.
     this.expireDurable(now, effects);
     if (this.state === LinkState.Connected) {
+      // A repair batch can itself be lost. Retry it on a bounded timer, but do
+      // not let every duplicate ACK synchronously clone the retained suffix.
+      if (
+        this.repairCursor !== null &&
+        this.repairCursor < this.sendSeq &&
+        now - this.repairSentAt >= this.params.heartbeatIntervalMs
+      ) {
+        this.repairSentAt = now;
+        this.resendWithGapAnnounce(this.repairCursor + 1n, effects, now);
+      }
       if (now - this.lastSendAt >= this.params.heartbeatIntervalMs) {
         effects.push(this.transmit({ t: 'heartbeat', ack: this.recvCursor }, now));
       }
@@ -330,10 +346,21 @@ export class Endpoint {
    */
   private onPeerCursor(peerCursor: Seq, now: number): Effect[] {
     const effects: Effect[] = [];
+    // ACKs are cumulative. Once a higher cursor has been observed and pruned,
+    // an older ACK can only be stale/in-flight; it must never rewind recovery.
+    if (peerCursor < this.outboxBase) return effects;
     this.pruneOutbox(peerCursor, effects);
-    if (peerCursor < this.sendSeq) {
-      this.resendWithGapAnnounce(peerCursor + 1n, effects, now);
+    if (peerCursor >= this.sendSeq) {
+      this.repairCursor = null;
+      return effects;
     }
+    // A burst behind one missing DATA can queue many identical ACKs before the
+    // first repair crosses the wire. Emit one bounded repair batch for that
+    // cursor; onTick retries it if the batch itself is lost.
+    if (this.repairCursor === peerCursor) return effects;
+    this.repairCursor = peerCursor;
+    this.repairSentAt = now;
+    this.resendWithGapAnnounce(peerCursor + 1n, effects, now);
     return effects;
   }
 
@@ -343,20 +370,10 @@ export class Endpoint {
    *  entry lost in a restart). Without the RESET the peer treats the resend as a
    *  hole, re-ACKs, and we livelock resending forever. */
   private resendWithGapAnnounce(fromSeq: Seq, effects: Effect[], now: number): void {
-    const oldest = this.oldestRetainedSeq();
-    if (oldest !== null && oldest > fromSeq) {
-      effects.push(this.transmit({ t: 'reset', epoch: this.epoch, oldest }, now));
-    }
+    // resendFrom already injects RESET exactly where the sparse outbox first
+    // skips sequence space. Emitting a head RESET here as well duplicates the
+    // same control frame for a coalesced/purged prefix.
     this.resendFrom(fromSeq, effects, now);
-  }
-
-  /** Lowest seq still held in the outbox, or null if empty. */
-  private oldestRetainedSeq(): Seq | null {
-    let min: Seq | null = null;
-    for (const e of this.outbox) {
-      if (min === null || e.seq < min) min = e.seq;
-    }
-    return min;
   }
 
   private onReset(f: Extract<Frame, { t: 'reset' }>): Effect[] {
@@ -422,6 +439,9 @@ export class Endpoint {
     const hadDurable = this.outbox.some((e) => e.seq <= clamped && e.durable);
     this.outbox = this.outbox.filter((e) => e.seq > clamped);
     this.outboxBase = clamped;
+    if (this.repairCursor !== null && clamped > this.repairCursor) {
+      this.repairCursor = null;
+    }
     // Surface the confirmed delivery floor so the app can resolve/roll back
     // optimistic UI for messages it sent. Observational only.
     effects?.push({ t: 'acked', seqUpTo: clamped });
@@ -451,6 +471,9 @@ export class Endpoint {
       return Math.min(
         this.lastSendAt + this.params.heartbeatIntervalMs,
         this.lastRecvAt + this.params.deadAfterMs,
+        this.repairCursor === null
+          ? Number.POSITIVE_INFINITY
+          : this.repairSentAt + this.params.heartbeatIntervalMs,
       );
     }
     return this.reconnectAt;
