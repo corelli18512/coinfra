@@ -597,7 +597,18 @@ export class Endpoint {
   }
 
   private loadSnapshot(s: Snapshot): void {
-    this.epoch = s.epoch;
+    // NOTE: `this.epoch` is intentionally NOT restored from the snapshot.
+    // The epoch identifies a SEND STREAM's identity (spec §9). A process
+    // restart is, by definition, a new stream: the durable outbox entries
+    // we restore will be resent under our current (fresh) epoch, and any
+    // non-durable sends that were in flight are lost — the peer MUST learn
+    // this discontinuity so it resets its recvCursor and accepts the new
+    // stream from its resumed seqs, instead of treating our post-restart
+    // seq=1..N as duplicates of the pre-crash seq=1..N it already delivered
+    // (the 2026-07-11 kraki relay-restart device_joined-loss bug). Restoring
+    // the old epoch would make the restart look transparent to the peer,
+    // but a non-durable send-gap is NOT transparent — so the epoch must
+    // roll forward. Keep `opts.epoch` (the freshly-generated value).
     this.sendSeq = BigInt(s.sendSeq);
     this.outboxBase = BigInt(s.outboxBase);
     // Defensive clamp: a snapshot persisted by a pre-0.3.1 version could have
