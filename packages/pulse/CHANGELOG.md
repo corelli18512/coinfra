@@ -1,5 +1,11 @@
 # @coinfra/pulse
 
+## 0.3.3
+
+### Patch Changes
+
+- 4c0abbb: Bound duplicate cursor repair so a burst of stale ACKs emits one RESET and retained suffix instead of amplifying into a resend storm. Retry a lost repair on the heartbeat timer, ignore regressive ACKs, and keep the TypeScript and Swift state machines aligned.
+
 ## 0.3.2
 
 ### Patch Changes
