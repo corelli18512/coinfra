@@ -439,7 +439,7 @@ class ManualPair {
   flushA(): void {
     this.flush(this.a.onTick(1), 'A');
   }
-  private flush(effects: Effect[], from: 'A' | 'B'): void {
+  flush(effects: Effect[], from: 'A' | 'B'): void {
     for (const e of effects) {
       if (e.t === 'deliver' && from === 'B') this.deliveredB.push({ seq: e.seq, payload: e.payload });
       if (e.t !== 'transmit' || !this.linkUp) continue;
