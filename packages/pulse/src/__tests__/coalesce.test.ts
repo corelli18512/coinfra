@@ -119,7 +119,12 @@ describe('COALESCE-SNAPSHOT: coalesceKey survives snapshot round-trip', () => {
     // coalesceKey deserialized correctly.
     const { effects } = restored.send(marker(3), { coalesceKey: 'k1' });
     expect(restored.outboxSize).toBe(1);
-    expect(effects).toContainEqual({ t: 'purged', droppedSeqs: [2n], reason: 'coalesced:k1' });
+    expect(effects).toContainEqual({
+      t: 'purged',
+      droppedSeqs: [2n],
+      reason: 'coalesced:k1',
+      streamId: 0,
+    });
   });
 });
 
@@ -139,7 +144,12 @@ describe('COALESCE-IN-FLIGHT: an already-transmitted entry is coalesced before a
     expect(w.a.outboxSize).toBe(1);
     // seq=1 was already delivered, so the purged effect still fires for
     // observability even though the entry was never durable.
-    expect(effects).toContainEqual({ t: 'purged', droppedSeqs: [1n], reason: 'coalesced:k1' });
+    expect(effects).toContainEqual({
+      t: 'purged',
+      droppedSeqs: [1n],
+      reason: 'coalesced:k1',
+      streamId: 0,
+    });
 
     // Pump the new transmit through to the peer.
     w.pump(effects, 'AtoB');

@@ -56,19 +56,19 @@ export type Effect =
    * back on timeout if this never arrives. Purely observational; emitting it
    * changes no protocol behavior.
    */
-  | { t: 'acked'; seqUpTo: Seq }
+  | { t: 'acked'; seqUpTo: Seq; streamId?: number }
   /**
    * Persist this outbox entry to durable storage (survives a process restart).
    * Emitted only by a durable-supported endpoint, only for durable sends. The
    * adapter writes (seq → payload) to disk. Carries ONLY seq and bytes — never a
    * destination, key, or routing hint (the core has none).
    */
-  | { t: 'store'; seq: Seq; payload: Payload }
+  | { t: 'store'; seq: Seq; payload: Payload; streamId?: number }
   /**
    * Durable entries with seq ≤ `seqUpTo` are confirmed delivered (or expired)
    * and may be deleted from durable storage.
    */
-  | { t: 'unstore'; seqUpTo: Seq }
+  | { t: 'unstore'; seqUpTo: Seq; streamId?: number }
   /**
    * Observational: the host purged outbox entries via {@link Endpoint.purge} or
    * {@link Endpoint.purgeNonDurable}. `droppedSeqs` are the seqs that were
@@ -77,7 +77,7 @@ export type Effect =
    * delivery is not re-attempted. The application may want to log or surface
    * that these sends will never confirm.
    */
-  | { t: 'purged'; droppedSeqs: Seq[]; reason: string };
+  | { t: 'purged'; droppedSeqs: Seq[]; reason: string; streamId?: number };
 
 /** Tunable parameters. Defaults in spec/PROTOCOL.md §8. */
 export interface PulseParams {
