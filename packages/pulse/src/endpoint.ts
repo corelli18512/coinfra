@@ -343,6 +343,7 @@ export class Endpoint {
         payload: f.payload,
         durable: f.durable,
         coalesceKey: f.coalesceKey,
+        streamId: this.streamId,
       });
     } else if (f.seq <= this.recvCursor) {
       // Duplicate (a resend because our earlier ack was lost). Re-advertise our
