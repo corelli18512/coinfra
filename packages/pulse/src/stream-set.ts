@@ -25,7 +25,7 @@
  * stream.
  */
 
-import { Endpoint } from './endpoint.js';
+import type { Endpoint } from './endpoint.js';
 import type { Effect } from './types.js';
 import { decodeFrameWithStream } from './wire.js';
 
@@ -61,7 +61,11 @@ export class StreamSet {
   }
 
   /** Send on a specific stream. Throws if the stream isn't registered. */
-  send(streamId: number, payload: Uint8Array, opts?: SendOptions): { seq: bigint; effects: Effect[] } {
+  send(
+    streamId: number,
+    payload: Uint8Array,
+    opts?: SendOptions,
+  ): { seq: bigint; effects: Effect[] } {
     const ep = this.streams.get(streamId);
     if (!ep) throw new Error(`unknown stream ${streamId}`);
     return ep.send(payload, opts);
@@ -71,7 +75,10 @@ export class StreamSet {
    *  returned in ascending stream order. */
   onConnected(now: number): Effect[] {
     const out: Effect[] = [];
-    for (const id of this.order) out.push(...this.streams.get(id)!.onConnected(now));
+    for (const id of this.order) {
+      const ep = this.streams.get(id);
+      if (ep) out.push(...ep.onConnected(now));
+    }
     return out;
   }
 
@@ -79,7 +86,10 @@ export class StreamSet {
    *  outbox for resume). */
   onDisconnected(now: number): Effect[] {
     const out: Effect[] = [];
-    for (const id of this.order) out.push(...this.streams.get(id)!.onDisconnected(now));
+    for (const id of this.order) {
+      const ep = this.streams.get(id);
+      if (ep) out.push(...ep.onDisconnected(now));
+    }
     return out;
   }
 
@@ -100,7 +110,10 @@ export class StreamSet {
    *  the returned batch. */
   onTick(now: number): Effect[] {
     const out: Effect[] = [];
-    for (const id of this.order) out.push(...this.streams.get(id)!.onTick(now));
+    for (const id of this.order) {
+      const ep = this.streams.get(id);
+      if (ep) out.push(...ep.onTick(now));
+    }
     return out;
   }
 }

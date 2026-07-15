@@ -11,8 +11,8 @@
 import { describe, expect, it } from 'vitest';
 import { Endpoint } from '../endpoint.js';
 import { StreamSet } from '../stream-set.js';
-import { decodeFrameWithStream, encodeFrame, VERSION, V1_VERSION } from '../wire.js';
 import type { Effect } from '../types.js';
+import { decodeFrameWithStream, encodeFrame, V1_VERSION, VERSION } from '../wire.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -79,7 +79,13 @@ class MultiWorld {
       const newA = this.cross(bEffects, 'b');
       this.recordDeliveries(newB, tagToStream);
       this.recordDeliveries(newA, tagToStream);
-      if (!hasTransmit(newB) && !hasTransmit(newA) && !hasTransmit(aEffects) && !hasTransmit(bEffects)) break;
+      if (
+        !hasTransmit(newB) &&
+        !hasTransmit(newA) &&
+        !hasTransmit(aEffects) &&
+        !hasTransmit(bEffects)
+      )
+        break;
       aEffects = newA;
       bEffects = newB;
     }
@@ -123,21 +129,27 @@ describe('wire multi-stream header', () => {
   it('decodes a v1 frame as streamId=0', () => {
     const v1 = encodeFrame({ t: 'heartbeat', ack: 5n }, 0);
     const d = decodeFrameWithStream(v1);
-    expect(d).not.toBeNull();
-    expect(d!.streamId).toBe(0);
-    expect(d!.frame).toEqual({ t: 'heartbeat', ack: 5n });
+    expect(d?.streamId).toBe(0);
+    expect(d?.frame).toEqual({ t: 'heartbeat', ack: 5n });
   });
 
   it('decodes a v2 frame with its streamId', () => {
     const v2 = encodeFrame({ t: 'heartbeat', ack: 5n }, 42);
     const d = decodeFrameWithStream(v2);
-    expect(d!.streamId).toBe(42);
-    expect(d!.frame).toEqual({ t: 'heartbeat', ack: 5n });
+    expect(d?.streamId).toBe(42);
+    expect(d?.frame).toEqual({ t: 'heartbeat', ack: 5n });
   });
 
   it('round-trips every frame type with a non-zero streamId', () => {
     const frames = [
-      { t: 'hello', epoch: 'e', recvEpoch: 're', recvCursor: 3n, durableSupported: true, maxRetentionMs: 0n },
+      {
+        t: 'hello',
+        epoch: 'e',
+        recvEpoch: 're',
+        recvCursor: 3n,
+        durableSupported: true,
+        maxRetentionMs: 0n,
+      },
       { t: 'data', seq: 1n, ack: 0n, payload: tag('hi'), durable: false },
       { t: 'data', seq: 2n, ack: 1n, payload: tag('x'), durable: true, coalesceKey: 'k' },
       { t: 'ack', ack: 9n },
@@ -147,9 +159,8 @@ describe('wire multi-stream header', () => {
     for (const f of frames) {
       for (const streamId of [0, 1, 255]) {
         const d = decodeFrameWithStream(encodeFrame(f, streamId));
-        expect(d, `streamId=${streamId} frame=${f.t}`).not.toBeNull();
-        expect(d!.streamId).toBe(streamId);
-        expect(d!.frame).toEqual(f);
+        expect(d?.streamId, `streamId=${streamId} frame=${f.t}`).toBe(streamId);
+        expect(d?.frame, `streamId=${streamId} frame=${f.t}`).toEqual(f);
       }
     }
   });
@@ -218,7 +229,9 @@ describe('StreamSet head-of-line isolation', () => {
     const firstBulkIdx = world.deliveredB.findIndex((d) => d.stream === 1);
     expect(liveIdx).toBeGreaterThanOrEqual(0);
     expect(firstBulkIdx).toBeGreaterThanOrEqual(0);
-    expect(liveIdx, 'live delivered before the first bulk (no HOL blocking)').toBeLessThan(firstBulkIdx);
+    expect(liveIdx, 'live delivered before the first bulk (no HOL blocking)').toBeLessThan(
+      firstBulkIdx,
+    );
   });
 });
 
