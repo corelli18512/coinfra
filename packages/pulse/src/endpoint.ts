@@ -66,6 +66,11 @@ export class Endpoint {
   private readonly durable: DurableConfig;
   /** Whether the peer advertised it can persist (learned from its HELLO). */
   private peerDurableSupported = false;
+  /** Which logical stream this endpoint owns on a shared link (spec §13).
+   *  Default 0 = legacy single stream. Carried in every frame's v2 header so a
+   *  peer {@link StreamSet} can route it; an independent seq/ack/outbox makes a
+   *  bulk stream unable to head-of-line block a live stream. */
+  private readonly streamId: number;
 
   private state: LinkState = LinkState.Disconnected;
   private lastRecvAt = 0;
@@ -90,6 +95,7 @@ export class Endpoint {
     this.random = opts.random ?? Math.random;
     this.epoch = opts.epoch;
     this.durable = opts.durable ?? { supported: false };
+    this.streamId = opts.streamId ?? 0;
     if (opts.restore) this.loadSnapshot(opts.restore);
   }
 
@@ -207,6 +213,15 @@ export class Endpoint {
     this.clock = now;
     const frame = decodeFrame(bytes);
     if (frame === null) return []; // malformed ⇒ ignore (spec §5.0)
+    return this.onFrame(frame, now);
+  }
+
+  /** Handle an already-decoded frame. Public so a {@link StreamSet} (which
+   *  demuxes by streamId before dispatching) can feed each per-stream endpoint
+   *  its own frames without re-decoding. Sets `lastRecvAt` (any frame is
+   *  liveness evidence, spec §6). */
+  onFrame(frame: Frame, now: number): Effect[] {
+    this.clock = now;
     this.lastRecvAt = now;
     switch (frame.t) {
       case 'hello':
@@ -328,6 +343,7 @@ export class Endpoint {
         payload: f.payload,
         durable: f.durable,
         coalesceKey: f.coalesceKey,
+        streamId: this.streamId,
       });
     } else if (f.seq <= this.recvCursor) {
       // Duplicate (a resend because our earlier ack was lost). Re-advertise our
@@ -452,10 +468,11 @@ export class Endpoint {
   }
 
   /** Build a transmit effect and mark send activity. `now` optional for the
-   *  data-send path where lastSendAt is refreshed by the caller context. */
+   *  data-send path where lastSendAt is refreshed by the caller context. The
+   *  bytes carry this endpoint's streamId in the v2 header. */
   private transmit(frame: Frame, now?: number): Effect {
     if (now !== undefined) this.lastSendAt = now;
-    return { t: 'transmit', bytes: encodeFrame(frame) };
+    return { t: 'transmit', bytes: encodeFrame(frame, this.streamId) };
   }
 
   private backoffDelay(attempt: number): number {
@@ -484,6 +501,10 @@ export class Endpoint {
 
   get link(): LinkState {
     return this.state;
+  }
+  /** The logical stream this endpoint owns on a shared link (spec §13). */
+  get stream(): number {
+    return this.streamId;
   }
   get sendSeqValue(): Seq {
     return this.sendSeq;

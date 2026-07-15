@@ -115,6 +115,11 @@ public final class Endpoint {
 
     private let durable: DurableConfig
     private var peerDurableSupported = false
+    /// Which logical stream this endpoint owns on a shared link (spec §13).
+    /// Default 0 = legacy single stream. Carried in every frame's v2 header so
+    /// a peer StreamSet can route it; an independent seq/ack/outbox makes a
+    /// bulk stream unable to head-of-line block a live stream.
+    private let streamId: UInt8
 
     private var state: LinkState = .disconnected
     private var lastRecvAt: Int = 0
@@ -136,12 +141,14 @@ public final class Endpoint {
         params: PulseParams = PulseParams(),
         random: @escaping () -> Double = { Double.random(in: 0..<1) },
         restore: Snapshot? = nil,
-        durable: DurableConfig? = nil
+        durable: DurableConfig? = nil,
+        streamId: UInt8 = 0
     ) {
         self.params = params
         self.random = random
         self.epoch = epoch
         self.durable = durable ?? DurableConfig(supported: false)
+        self.streamId = streamId
         if let s = restore { load(s) }
     }
 
@@ -222,6 +229,15 @@ public final class Endpoint {
     public func onBytes(_ bytes: [UInt8], _ now: Int) -> [Effect] {
         clock = now
         guard let frame = decodeFrame(bytes) else { return [] }  // malformed ⇒ ignore
+        return onFrame(frame, now)
+    }
+
+    /// Handle an already-decoded frame. Public so a StreamSet (which demuxes
+    /// by streamId before dispatching) can feed each per-stream endpoint its
+    /// own frames without re-decoding. Sets `lastRecvAt` (any frame is
+    /// liveness evidence, spec §6).
+    public func onFrame(_ frame: Frame, _ now: Int) -> [Effect] {
+        clock = now
         lastRecvAt = now
         switch frame {
         case let .hello(epoch, recvEpoch, recvCursor, durableSupported, _):
@@ -419,7 +435,7 @@ public final class Endpoint {
         if let n = now { lastSendAt = n }
         // encodeFrame only throws on >255-byte epoch; epochs are bounded by the
         // caller, so a failure here is a programming error — trap it.
-        return .transmit(try! encodeFrame(frame))
+        return .transmit(try! encodeFrame(frame, streamId: streamId))
     }
 
     private func backoffDelay(_ attempt: Int) -> Int {
@@ -443,6 +459,8 @@ public final class Endpoint {
     }
 
     public var link: LinkState { state }
+    /// The logical stream this endpoint owns on a shared link (spec §13).
+    public var stream: UInt8 { streamId }
     public var sendSeqValue: UInt64 { sendSeq }
     public var recvCursorValue: UInt64 { recvCursor }
     public var outboxSize: Int { outbox.count }

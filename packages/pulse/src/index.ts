@@ -14,6 +14,7 @@
 
 export { PulseSocket, type PulseSocketOptions } from './adapter-ws.js';
 export { Endpoint } from './endpoint.js';
+export { type SendOptions, StreamSet } from './stream-set.js';
 export {
   DEFAULT_PARAMS,
   type Effect,
@@ -26,10 +27,13 @@ export {
   type Snapshot,
 } from './types.js';
 export {
+  type DecodedFrame,
   decodeFrame,
+  decodeFrameWithStream,
   encodeFrame,
   type Frame,
   FrameType,
   MAGIC,
+  V1_VERSION,
   VERSION,
 } from './wire.js';

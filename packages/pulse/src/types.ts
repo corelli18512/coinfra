@@ -30,7 +30,14 @@ export type Effect =
    *  the sender's send-time coalesce hint (spec §12) when present, so a bridging
    *  application (e.g. a store-and-forward hub) can re-apply the same key when
    *  forwarding onto another hop. Both are pure transport info. */
-  | { t: 'deliver'; seq: Seq; payload: Payload; durable: boolean; coalesceKey?: string }
+  | {
+      t: 'deliver';
+      seq: Seq;
+      payload: Payload;
+      durable: boolean;
+      coalesceKey?: string;
+      streamId?: number;
+    }
   /** Begin establishing the link (dial). */
   | { t: 'open' }
   /** Tear down the current link (dead/stale). */
@@ -140,6 +147,15 @@ export interface EndpointOptions {
   restore?: Snapshot;
   /** Durability capability. Defaults to { supported: false }. */
   durable?: DurableConfig;
+  /**
+   * Which logical stream this endpoint owns on a shared link (spec §13,
+   * multi-stream). Default 0 = the single legacy stream. A non-zero id makes
+   * this endpoint an independent ordered flow with its own seq/ack/outbox, so
+   * a bulk stream cannot head-of-line block a live stream. All frames this
+   * endpoint produces carry `streamId` in the v2 wire header; the peer routes
+   * by id. Endpoints that use streamId > 0 require a peer that also speaks v2.
+   */
+  streamId?: number;
 }
 
 export const LinkState = {
