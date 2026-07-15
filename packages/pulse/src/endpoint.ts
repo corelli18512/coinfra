@@ -137,7 +137,12 @@ export class Endpoint {
       // No unstore: coalesceable entries are never durable (guarded above), so
       // nothing was ever persisted. Emit `purged` for logs/metrics only.
       if (droppedSeqs.length > 0) {
-        effects.push({ t: 'purged', droppedSeqs, reason: `coalesced:${key}` });
+        effects.push({
+          t: 'purged',
+          droppedSeqs,
+          reason: `coalesced:${key}`,
+          streamId: this.streamId,
+        });
       }
     }
     this.sendSeq += 1n;
@@ -150,7 +155,7 @@ export class Endpoint {
     this.outbox.push({ seq, payload, durable, sentAt: this.clock, coalesceKey: opts?.coalesceKey });
     // Persist to durable storage immediately (before transmit), so it survives a
     // restart even if the socket is down right now. Only seq+bytes — no target.
-    if (durable) effects.push({ t: 'store', seq, payload });
+    if (durable) effects.push({ t: 'store', seq, payload, streamId: this.streamId });
     if (this.state === LinkState.Connected) {
       // The DATA durable bit is set only if the PEER can persist it; otherwise
       // it's pointless on the wire. (Our own `durable` above governs OUR outbox
@@ -286,7 +291,7 @@ export class Endpoint {
     const expiredSeqs = new Set(expired.map((e) => e.seq));
     this.outbox = this.outbox.filter((e) => !expiredSeqs.has(e.seq));
     const highest = expired.reduce((m, e) => (e.seq > m ? e.seq : m), 0n);
-    effects.push({ t: 'unstore', seqUpTo: highest });
+    effects.push({ t: 'unstore', seqUpTo: highest, streamId: this.streamId });
   }
 
   // ── Frame handlers ────────────────────────────────────────────────────────
@@ -463,8 +468,8 @@ export class Endpoint {
     }
     // Surface the confirmed delivery floor so the app can resolve/roll back
     // optimistic UI for messages it sent. Observational only.
-    effects?.push({ t: 'acked', seqUpTo: clamped });
-    if (hadDurable) effects?.push({ t: 'unstore', seqUpTo: clamped });
+    effects?.push({ t: 'acked', seqUpTo: clamped, streamId: this.streamId });
+    if (hadDurable) effects?.push({ t: 'unstore', seqUpTo: clamped, streamId: this.streamId });
   }
 
   /** Build a transmit effect and mark send activity. `now` optional for the
@@ -597,8 +602,10 @@ export class Endpoint {
     // We emit a coarse unstore(seqUpTo=maxDroppedDurableSeq); the adapter
     // only deletes durable rows it holds ≤ that seq, so leftover durable
     // entries > that seq are untouched.
-    if (hadDurable) effects.push({ t: 'unstore', seqUpTo: maxDroppedDurableSeq });
-    if (droppedSeqs.length > 0) effects.push({ t: 'purged', droppedSeqs, reason });
+    if (hadDurable)
+      effects.push({ t: 'unstore', seqUpTo: maxDroppedDurableSeq, streamId: this.streamId });
+    if (droppedSeqs.length > 0)
+      effects.push({ t: 'purged', droppedSeqs, reason, streamId: this.streamId });
     return { droppedSeqs, effects };
   }
 
