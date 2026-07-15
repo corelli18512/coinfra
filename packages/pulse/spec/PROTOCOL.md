@@ -149,16 +149,25 @@ function so the core is deterministic under test.
 Binary, big-endian. One frame = one link message.
 
 ```
-Header (3 bytes):
+Header:
   u8  magic   = 0xB1
-  u8  version = 0x01
+  u8  version = 0x01 (v1) or 0x02 (v2)
   u8  type    (1..5)
+  [u8 streamId]        # v2 only (spec §13); absent in v1 (streamId implicit 0)
 
 Primitives:
   str  = u8 length (0..255) || that many UTF-8 bytes
   blob = u32 length || that many bytes
   u64  = 8 bytes big-endian
 ```
+
+**Version 1 vs 2.** v1 is the original single-stream header (3 bytes). v2
+adds a 1-byte `streamId` after `type` (spec §13, multi-stream). v2 is emitted
+**only** when `streamId > 0`; a frame on the default stream (`streamId == 0`)
+is encoded as v1, byte-identical to the pre-§13 layout. Decoders accept BOTH:
+a v1 frame is a v2 frame with `streamId == 0`. An old (v1-only) peer cannot
+parse a v2 frame, so endpoints that actually use multiple streams must upgrade
+together (the application decides when to open stream ids > 0).
 
 | type | name | body |
 |------|------|------|
@@ -486,8 +495,12 @@ Every row is a scenario the test suites (`ts/src/__tests__`,
 ## 10. What Pulse does NOT do
 
 - It does not encrypt. Payloads are opaque bytes; wrap them yourself.
-- It does not know message *types*, *sessions*, or *identities* — one flat seq
-  stream per direction. Multiplexing/routing is the caller's job above pulse.
+- It does not know message *types*, *sessions*, or *identities*. The unit of
+  delivery is one flat ordered seq stream per direction — but a single link may
+  carry **multiple independent streams** (spec §13), so the application can keep
+  low-latency traffic off the same ordered queue as bulk transfers. Pulse routes
+  by a 1-byte `streamId` on the wire; how the application maps its messages to
+  streams (and whether it uses more than the default stream 0) is above Pulse.
 - It does not persist. The core holds outbox/cursor in memory; **durability
   across process restart is an adapter capability** — the adapter snapshots
   (`epoch`, `outbox`, `outboxBase`, `sendSeq`, `recvCursor`, `peerEpoch`) and
@@ -657,3 +670,57 @@ trailing `coalesceKey` str (≤255 UTF-8 bytes; §5.0). `OutboxEntry` in the
 snapshot (§10) gains `coalesceKey?: string`. Both are additive: pre-§12 peers
 and snapshots interoperate unchanged — an old decoder ignores the trailing key,
 and a new frame without a key is byte-identical to the old layout.
+
+---
+
+## 13. Multi-stream (priority isolation)
+
+A single ordered stream is a FIFO: a message produced after a burst of bulk
+transfers is assigned a seq behind all of them and cannot be delivered until
+they are. For traffic that is genuinely sequenced (a conversation) this is
+correct. For traffic that is **independent** it is head-of-line blocking: a live
+reply, an abort, or a status-card update should not wait behind a history
+replay, a turn-trace batch, or an attachment chunk that happened to be sent
+first.
+
+Pulse solves this with **multiple independent streams on one shared link**.
+Each stream is a full `Endpoint` — its own epoch, seq space, outbox, receive
+cursor, handshake, liveness timers, durability. Streams share only the physical
+link (one WebSocket); connect/disconnect events are broadcast to every stream.
+
+### 13.1 Wire
+
+The v2 header carries a 1-byte `streamId` (§5.0). A frame on stream 0 is
+encoded as v1 (byte-identical to a pre-§13 peer); a frame on any other stream
+is encoded as v2. A decoder accepts both and routes each frame to the endpoint
+that owns its `streamId`. Frames for an unknown / unregistered stream are
+dropped (the peer may have a stream we have not opened — harmless, like an
+unknown frame type).
+
+### 13.2 Independence
+
+Every guarantee in §9 holds **per stream**: in-order exactly-once delivery,
+resume across reconnects, restart-durability, coalescing, GC. A RESET, a
+reconnect, or a coalesce on one stream does not affect any other stream's
+cursor or outbox. A bulk stream can be saturated, repaired, purged, or reset
+without a live stream noticing — the live stream's seq 5 is not behind the bulk
+stream's seq 1..N because they are different seq spaces.
+
+### 13.3 Scheduling
+
+`onTick` visits streams in ascending `streamId` order, so a lower-numbered
+(live) stream's `Transmit` effects are emitted before a higher-numbered (bulk)
+stream's within one tick window. An adapter that flushes transmit effects in
+the order Pulse returns them therefore sends live traffic first. Per-stream
+independence is what closes the HOL gap: combined with the per-stream seq
+space, a live transmit is never queued behind bulk seqs.
+
+### 13.4 Application responsibility
+
+Pulse provides the streams and the routing; it does not decide which
+application message goes on which stream. A typical mapping: stream 0 = live
+(user messages, agent replies, aborts, status cards, permissions/questions,
+liveness heartbeats); stream 1 = bulk (history range batches, turn-trace
+batches, attachment chunks). Using only stream 0 recovers the pre-§13
+single-stream behavior exactly. Endpoints that use stream ids > 0 must peer
+with a v2-capable endpoint (the application arranges this).

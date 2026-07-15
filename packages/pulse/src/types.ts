@@ -140,6 +140,15 @@ export interface EndpointOptions {
   restore?: Snapshot;
   /** Durability capability. Defaults to { supported: false }. */
   durable?: DurableConfig;
+  /**
+   * Which logical stream this endpoint owns on a shared link (spec §13,
+   * multi-stream). Default 0 = the single legacy stream. A non-zero id makes
+   * this endpoint an independent ordered flow with its own seq/ack/outbox, so
+   * a bulk stream cannot head-of-line block a live stream. All frames this
+   * endpoint produces carry `streamId` in the v2 wire header; the peer routes
+   * by id. Endpoints that use streamId > 0 require a peer that also speaks v2.
+   */
+  streamId?: number;
 }
 
 export const LinkState = {

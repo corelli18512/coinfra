@@ -3,16 +3,28 @@
  * spec/FIXTURES.md. Pure functions; byte-for-byte identical to the Swift port.
  *
  * Layout (big-endian):
- *   header : u8 magic=0xB1 · u8 version=0x01 · u8 type
+ *   header v1: u8 magic=0xB1 · u8 version=0x01 · u8 type
+ *   header v2: u8 magic=0xB1 · u8 version=0x02 · u8 type · u8 streamId
  *   str    : u8 len · len UTF-8 bytes
  *   blob   : u32 len · len bytes
  *   u64    : 8 bytes big-endian
+ *
+ * v2 adds a 1-byte `streamId` to the header (spec §13, multi-stream). v2 is
+ * used whenever `streamId > 0`; `streamId === 0` is encoded as v1 so a
+ * single-stream peer is byte-identical to the pre-§13 wire format. Decoders
+ * accept BOTH versions (a v1 frame is a v2 frame with streamId=0), so a new
+ * peer can read an old peer; an old peer cannot read a v2 frame, so endpoints
+ * that actually use multiple streams must upgrade together (negotiated by the
+ * application above Pulse).
  */
 
 import type { Seq } from './types.js';
 
 export const MAGIC = 0xb1;
-export const VERSION = 0x01;
+/** Current wire version (encodes the streamId header). */
+export const VERSION = 0x02;
+/** Legacy wire version accepted on decode (streamId implicit 0). */
+export const V1_VERSION = 0x01;
 
 export const FrameType = {
   HELLO: 1,
@@ -31,7 +43,7 @@ export type Frame =
       /** This endpoint can persist its outbox across a process restart. */
       durableSupported: boolean;
       /** How long a persisted entry is kept (ms). Meaningful only when
-       *  durableSupported; 0 otherwise. */
+       * durableSupported; 0 otherwise. */
       maxRetentionMs: Seq;
     }
   | { t: 'data'; seq: Seq; ack: Seq; payload: Uint8Array; durable: boolean; coalesceKey?: string }
@@ -40,6 +52,14 @@ export type Frame =
   | { t: 'heartbeat'; ack: Seq };
 
 const U64_MAX = (1n << 64n) - 1n;
+
+/** A decoded frame together with the stream it belongs to. `streamId` is a
+ *  transport-routing concern (which logical stream on the shared link), not a
+ *  property of the frame itself — so it is returned alongside, not inside. */
+export interface DecodedFrame {
+  frame: Frame;
+  streamId: number;
+}
 
 // ── Encoder ──────────────────────────────────────────────────────────────────
 
@@ -68,21 +88,30 @@ class Writer {
     this.u32(b.length);
     for (const x of b) this.parts.push(x);
   }
-  header(type: number): void {
+  /** Write the header. v2 (with streamId) is used for any non-default stream;
+   *  streamId=0 is encoded as v1 so single-stream peers stay byte-identical to
+   *  the pre-§13 wire format. */
+  header(type: number, streamId: number): void {
     this.u8(MAGIC);
-    this.u8(VERSION);
-    this.u8(type);
+    if (streamId > 0) {
+      this.u8(VERSION);
+      this.u8(type);
+      this.u8(streamId);
+    } else {
+      this.u8(V1_VERSION);
+      this.u8(type);
+    }
   }
   done(): Uint8Array {
     return new Uint8Array(this.parts);
   }
 }
 
-export function encodeFrame(f: Frame): Uint8Array {
+export function encodeFrame(f: Frame, streamId = 0): Uint8Array {
   const w = new Writer();
   switch (f.t) {
     case 'hello':
-      w.header(FrameType.HELLO);
+      w.header(FrameType.HELLO, streamId);
       w.str(f.epoch);
       w.str(f.recvEpoch);
       w.u64(f.recvCursor);
@@ -90,7 +119,7 @@ export function encodeFrame(f: Frame): Uint8Array {
       w.u64(f.maxRetentionMs);
       break;
     case 'data':
-      w.header(FrameType.DATA);
+      w.header(FrameType.DATA, streamId);
       // flags: bit0 = durable (existing), bit1 = has coalesceKey (spec §12).
       w.u8((f.durable ? 1 : 0) | (f.coalesceKey !== undefined ? 2 : 0));
       w.u64(f.seq);
@@ -101,16 +130,16 @@ export function encodeFrame(f: Frame): Uint8Array {
       if (f.coalesceKey !== undefined) w.str(f.coalesceKey);
       break;
     case 'ack':
-      w.header(FrameType.ACK);
+      w.header(FrameType.ACK, streamId);
       w.u64(f.ack);
       break;
     case 'reset':
-      w.header(FrameType.RESET);
+      w.header(FrameType.RESET, streamId);
       w.str(f.epoch);
       w.u64(f.oldest);
       break;
     case 'heartbeat':
-      w.header(FrameType.HEARTBEAT);
+      w.header(FrameType.HEARTBEAT, streamId);
       w.u64(f.ack);
       break;
   }
@@ -168,57 +197,80 @@ class Reader {
 }
 
 /**
- * Decode wire bytes to a frame, or `null` if malformed / unknown / truncated.
- * MUST NOT throw on bad input.
+ * Decode wire bytes to a frame + its stream id, or `null` if malformed /
+ * unknown / truncated. MUST NOT throw on bad input. Accepts both v1 (streamId
+ * implicit 0) and v2 (streamId in header) frames.
  */
-export function decodeFrame(bytes: Uint8Array): Frame | null {
+export function decodeFrameWithStream(bytes: Uint8Array): DecodedFrame | null {
   try {
     const r = new Reader(bytes);
     if (r.u8() !== MAGIC) return null;
-    if (r.u8() !== VERSION) return null;
-    const type = r.u8();
-    switch (type) {
-      case FrameType.HELLO: {
-        const epoch = r.str();
-        const recvEpoch = r.str();
-        const recvCursor = r.u64();
-        const durFlags = r.u8();
-        const maxRetentionMs = r.u64();
-        return {
-          t: 'hello',
-          epoch,
-          recvEpoch,
-          recvCursor,
-          durableSupported: (durFlags & 1) === 1,
-          maxRetentionMs,
-        };
-      }
-      case FrameType.DATA: {
-        const msgFlags = r.u8();
-        const seq = r.u64();
-        const ack = r.u64();
-        const payload = r.blob();
-        const durable = (msgFlags & 1) === 1;
-        // bit1 ⇒ a trailing coalesceKey str follows the payload (spec §12).
-        if ((msgFlags & 2) === 2) {
-          const coalesceKey = r.str();
-          return { t: 'data', seq, ack, payload, durable, coalesceKey };
-        }
-        return { t: 'data', seq, ack, payload, durable };
-      }
-      case FrameType.ACK:
-        return { t: 'ack', ack: r.u64() };
-      case FrameType.RESET: {
-        const epoch = r.str();
-        const oldest = r.u64();
-        return { t: 'reset', epoch, oldest };
-      }
-      case FrameType.HEARTBEAT:
-        return { t: 'heartbeat', ack: r.u64() };
-      default:
-        return null; // unknown type
+    const version = r.u8();
+    let streamId = 0;
+    if (version === VERSION) {
+      // v2: type is followed by a 1-byte streamId.
+      const type = r.u8();
+      streamId = r.u8();
+      return { frame: readBody(r, type), streamId };
     }
+    if (version === V1_VERSION) {
+      // v1: no streamId; frame belongs to the default stream 0.
+      const type = r.u8();
+      return { frame: readBody(r, type), streamId: 0 };
+    }
+    return null; // unknown version
   } catch {
     return null; // truncated / malformed
+  }
+}
+
+/** Decode wire bytes to a frame, dropping the stream id. Convenience for
+ *  single-stream endpoints that only own stream 0. Equivalent to
+ *  `decodeFrameWithStream(bytes)?.frame ?? null`. */
+export function decodeFrame(bytes: Uint8Array): Frame | null {
+  return decodeFrameWithStream(bytes)?.frame ?? null;
+}
+
+function readBody(r: Reader, type: number): Frame {
+  switch (type) {
+    case FrameType.HELLO: {
+      const epoch = r.str();
+      const recvEpoch = r.str();
+      const recvCursor = r.u64();
+      const durFlags = r.u8();
+      const maxRetentionMs = r.u64();
+      return {
+        t: 'hello',
+        epoch,
+        recvEpoch,
+        recvCursor,
+        durableSupported: (durFlags & 1) === 1,
+        maxRetentionMs,
+      };
+    }
+    case FrameType.DATA: {
+      const msgFlags = r.u8();
+      const seq = r.u64();
+      const ack = r.u64();
+      const payload = r.blob();
+      const durable = (msgFlags & 1) === 1;
+      // bit1 ⇒ a trailing coalesceKey str follows the payload (spec §12).
+      if ((msgFlags & 2) === 2) {
+        const coalesceKey = r.str();
+        return { t: 'data', seq, ack, payload, durable, coalesceKey };
+      }
+      return { t: 'data', seq, ack, payload, durable };
+    }
+    case FrameType.ACK:
+      return { t: 'ack', ack: r.u64() };
+    case FrameType.RESET: {
+      const epoch = r.str();
+      const oldest = r.u64();
+      return { t: 'reset', epoch, oldest };
+    }
+    case FrameType.HEARTBEAT:
+      return { t: 'heartbeat', ack: r.u64() };
+    default:
+      throw new Short(); // unknown type → caller maps to null
   }
 }
