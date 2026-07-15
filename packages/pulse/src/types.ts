@@ -30,7 +30,14 @@ export type Effect =
    *  the sender's send-time coalesce hint (spec §12) when present, so a bridging
    *  application (e.g. a store-and-forward hub) can re-apply the same key when
    *  forwarding onto another hop. Both are pure transport info. */
-  | { t: 'deliver'; seq: Seq; payload: Payload; durable: boolean; coalesceKey?: string; streamId?: number }
+  | {
+      t: 'deliver';
+      seq: Seq;
+      payload: Payload;
+      durable: boolean;
+      coalesceKey?: string;
+      streamId?: number;
+    }
   /** Begin establishing the link (dial). */
   | { t: 'open' }
   /** Tear down the current link (dead/stale). */
