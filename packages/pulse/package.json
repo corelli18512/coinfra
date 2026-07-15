@@ -1,6 +1,6 @@
 {
   "name": "@coinfra/pulse",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "The delivery contract: message sequencing, acks, and cursor-based resume for a breakable WebSocket channel. Pure logic, no I/O. Each client provides its own transport and storage.",
   "type": "module",
   "exports": {
